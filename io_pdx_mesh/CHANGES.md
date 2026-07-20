@@ -4,7 +4,7 @@ This directory is a **modified copy** of [io_pdx_mesh](https://github.com/ross-g
 v0.91 by **ross-g**, licensed GPL-3.0-or-later. Upstream has seen no release since
 2024-09-23, and v0.91 does not run correctly on Blender 4.x.
 
-Per GPL-3.0 §5(a), the modifications are listed below. Every change in the source
+Per GPL-3.0 section 5(a), the modifications are listed below. Every change in the source
 is also marked inline with a `# FORK:` comment or an explanatory block comment.
 
 ## 1. Blender 4.x - import crashed on multi-material meshes

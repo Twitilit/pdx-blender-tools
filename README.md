@@ -55,11 +55,11 @@ Its constants were **measured against the game**, not guessed. With every slider
 | Parameter | Finding |
 |---|---|
 | `velocity` | world units 1:1 |
-| planar force | acceleration in units/s² |
-| friction | exponential decay, `v *= exp(-amount·dt)` |
+| planar force | acceleration in units/s^2 |
+| friction | exponential decay, `v *= exp(-amount*dt)` |
 | `size` | quad size in world units |
-| `{base spread}` | symmetric ±, not one-sided |
-| `emission` | the engine spawns **~3×** a literal "particles/second" reading |
+| `{base spread}` | symmetric +/-, not one-sided |
+| `emission` | the engine spawns **~3x** a literal "particles/second" reading |
 | entity `scale` | scales the **particles too**, not just the mesh |
 
 The `.asset` axis conventions likewise had to be measured, and they are not uniform:
@@ -70,9 +70,11 @@ world space - the bone's rest rotation applies either way.
 It also warns about engine traps a preview cannot show by construction, such as mixing
 `local_space=yes/no` with alpha-blended subsystems, which makes HoI4 silently drop them.
 
-**Known limitation:** orientation of `billboard=no` quads does not match the game yet.
-The plane selection is correct; the in-plane axis is not, so crossed-beam configurations
-render wrongly. Do not author that geometry from the preview until it is fixed.
+`billboard=no` quads are oriented the way the engine orients them, including the
+non-obvious part: the in-plane axis at `rotation=0` is the emitter's *side* axis, not
+the direction of fire - so a quad meant to run along the shot in the `pitch=90` plane
+needs `rotation={ 90 0 }`. That was established by sweeping `rotation` in game rather
+than reasoned about, after two plausible-looking guesses both turned out wrong.
 
 Rendering uses Blender's `gpu` module rather than EEVEE materials - the only way to get
 true additive blending, which most of these effects rely on. It is viewport-only by
@@ -80,7 +82,7 @@ design: a measuring instrument, not a render path.
 
 Version history and the full list of known limitations:
 [`pdx_particle_bench/CHANGELOG.md`](pdx_particle_bench/CHANGELOG.md). The running
-version is shown at the bottom of the add-on's panel — worth checking, since this
+version is shown at the bottom of the add-on's panel - worth checking, since this
 add-on tends to exist in several copies at once and editing one does not change what
 Blender loaded.
 
@@ -91,13 +93,16 @@ Blender loaded.
 Both are ordinary Blender add-ons (tested on **4.2**).
 
 Each add-on is a self-contained folder. Zip the folder you want and install the zip via
-`Edit ▸ Preferences ▸ Add-ons ▸ Install…`, or copy the folder straight into Blender's
+`Edit > Preferences > Add-ons > Install...`, or copy the folder straight into Blender's
 `scripts/addons/`. Restart Blender afterwards. Installing one does not pull in the other.
 
 - **`pdx_particle_bench/`** - after enabling it, set **Mod root** and **Vanilla root** in
   its add-on preferences. `.asset` texture paths are game-relative, so they are resolved
   mod-first then vanilla, exactly as the game resolves them; most particle textures live
   in the vanilla install rather than in a mod.
+  Also set `Render > Color Management > View Transform` to **Standard**. Blender 4.x
+  defaults to AgX, which desaturates bright colour - fine for artwork, misleading when
+  you are comparing an effect against a screenshot. The panel warns if it is not set.
 - **`io_pdx_mesh/`** - if you already have upstream installed, replace that folder with
   this one.
 
@@ -108,7 +113,7 @@ Both panels appear in the 3D view sidebar (<kbd>N</kbd>) under **PDX Blender Too
 **GPL-3.0-or-later.**
 
 `io_pdx_mesh/` is a modified copy of [io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh),
-copyright © ross-g, used and redistributed under GPL-3.0-or-later. Modifications are
+copyright (C) ross-g, used and redistributed under GPL-3.0-or-later. Modifications are
 listed in [`io_pdx_mesh/CHANGES.md`](io_pdx_mesh/CHANGES.md) and marked inline with
 `# FORK:`. The original license text is kept at `io_pdx_mesh/license.txt`.
 

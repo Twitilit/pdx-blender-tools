@@ -22,9 +22,6 @@
 # mode in these effects. Viewport-only by design: a measuring instrument, not a
 # render path.
 #
-# KNOWN LIMITATION: orientation of `billboard=no` quads does not yet match the
-# game (see README). Plane selection is right; the in-plane axis is not.
-#
 # Copyright (C) 2026 pdx-blender-tools contributors.
 # SPDX-License-Identifier: GPL-3.0-or-later
 # =============================================================================
@@ -32,7 +29,7 @@
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 3, 0),
+    "version": (0, 4, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > PDX Blender Tools",
     "description": "Preview Clausewitz/HoI4 .asset particle effects on a real locator",
@@ -697,10 +694,12 @@ out vec4 fragColor;
 void main()
 {
     vec4 t = texture(image, v_uv);
-    /* The shape lives in the alpha channel on some .dds and in the luminance on
-       others; luminance * alpha covers both, same as the calibrated web Bench. */
-    float inten = dot(t.rgb, vec3(0.299, 0.587, 0.114)) * t.a;
-    fragColor = vec4(v_col.rgb, v_col.a * inten);
+    /* The engine MULTIPLIES the subsystem's `color=` by the texture rather than
+       replacing it, so a tinted texture shifts the result: a yellow beam texture
+       under a cyan color= comes out green, because yellow carries no blue.
+       Shape comes from the alpha channel, which is where every texture checked so
+       far keeps it. */
+    fragColor = vec4(v_col.rgb * t.rgb, v_col.a * t.a);
 }
 """
 
@@ -747,8 +746,16 @@ def oriented_quad_axes(s, axis_key, flip_yaw, flip_plume, rot3):
       pitch=90 -> normal is up   -> quad lies flat  (flash_secondary_h)
       pitch=0  -> normal is side -> quad stands up  (flash_secondary_v)
       yaw=pitch=0 -> normal is forward -> muzzle_ring faces along the shot
-    The texture's long axis (U) is the emitter's forward projected into the quad
-    plane, so an elongated flame plume points out of the barrel.
+    The in-plane axis at `rotation=0` is the emitter's SIDE axis projected into the
+    quad plane, falling back to the muzzle direction when side lies along the normal.
+    That single rule reproduces both measured cases:
+      normal = side (pitch=0)  -> side is degenerate -> U falls back to along the shot
+      normal = up   (pitch=90) -> U is the side axis -> across the shot at rotation=0
+
+    Measured in game with a four-value rotation sweep in the pitch=90 plane: only
+    `rotation=90` ran along the shot, `rotation=0` ran across. An earlier model used
+    the muzzle direction as the default in-plane axis, which got the pitch=0 plane
+    right and the pitch=90 plane exactly 90 degrees wrong.
     """
     fwd, up, right = basis(axis_key)
     yaw = math.radians(s.pyaw if flip_yaw else -s.pyaw)
@@ -762,12 +769,14 @@ def oriented_quad_axes(s, axis_key, flip_yaw, flip_plume, rot3):
         normal = fwd.copy()
     normal.normalize()
 
-    # The plume's long axis must point OUT of the barrel. On body-mounted locators
-    # the local forward runs tank-BACKWARD, so the muzzle direction is -fwd.
-    long_axis = fwd if flip_plume else -fwd
-    u = long_axis - normal * long_axis.dot(normal)
-    if u.length < 1e-4:  # quad normal lies along the barrel - any in-plane axis will do
-        u = right - normal * right.dot(normal)
+    # Default in-plane axis is the SIDE axis projected into the plane.
+    u = right - normal * right.dot(normal)
+    if u.length < 1e-4:
+        # Side lies along the normal, so it gives no in-plane direction. Fall back to
+        # the muzzle direction: on body-mounted locators the local forward runs
+        # tank-BACKWARD, so out of the barrel is -fwd.
+        long_axis = fwd if flip_plume else -fwd
+        u = long_axis - normal * long_axis.dot(normal)
     u.normalize()
     v = normal.cross(u)
 
@@ -1066,6 +1075,14 @@ class PPB_PT_panel(bpy.types.Panel):
         prefs = get_prefs()
         if not prefs or not (prefs.mod_root or prefs.vanilla_root):
             layout.label(text="Set mod/vanilla roots in Add-on Preferences", icon="ERROR")
+
+        # Blender 4.x defaults to the AgX view transform, which deliberately
+        # desaturates saturated colour as it brightens. Harmless for artwork, but
+        # this add-on is a measuring instrument: under AgX a red or magenta effect
+        # reads noticeably duller here than the same effect does in game.
+        if context.scene.view_settings.view_transform != "Standard":
+            layout.label(text="Colour is tone-mapped by view transform", icon="INFO")
+            layout.label(text="Render > Color Management > Standard to compare")
 
         col = layout.column(align=True)
         col.prop(props, "asset_path", text="")

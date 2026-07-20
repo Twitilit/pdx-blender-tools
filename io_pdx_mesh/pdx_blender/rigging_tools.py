@@ -160,23 +160,23 @@ class IOPDX_OT_flip_bone_head_tail(Operator):
 
 
 class IOPDX_OT_align_weapon_by_two_points(Operator):
-    """Align a weapon mesh by two vertices: midpoint at object origin, back→front along +Y.
+    """Align a weapon mesh by two vertices: midpoint at object origin, back->front along +Y.
 
     Workflow: in Edit Mode on a weapon mesh, select exactly 2 vertices. The
     ACTIVE (last clicked, white-highlighted) vertex is treated as the muzzle
     (front); the other as the back (stock/grip). The whole mesh is translated
     and rotated so the midpoint between the two vertices sits at the object's
-    local origin and the back→front vector lies along +Y. The object's
+    local origin and the back->front vector lies along +Y. The object's
     transform is then reset to identity so the weapon ends up at world (0,0,0)
     facing +Y.
     """
 
     bl_idname = "io_pdx_mesh.align_weapon_by_two_points"
-    bl_label = "Align weapon by 2 points (midpoint→origin, front→+Y)"
+    bl_label = "Align weapon by 2 points (midpoint->origin, front->+Y)"
     bl_description = (
         "In Edit Mode on a mesh, select exactly 2 vertices. The ACTIVE one is the "
         "muzzle (front); the other is the back. The mesh is translated/rotated so "
-        "the midpoint is at the object origin and the back→front axis is +Y. "
+        "the midpoint is at the object origin and the back->front axis is +Y. "
         "The object's transform is reset to identity (world origin, no rotation)."
     )
     bl_options = {"REGISTER", "UNDO"}
@@ -249,7 +249,7 @@ class IOPDX_OT_align_weapon_by_two_points(Operator):
 
         self.report(
             {"INFO"},
-            "Weapon aligned: midpoint at origin, back→front along +Y. Object transform reset.",
+            "Weapon aligned: midpoint at origin, back->front along +Y. Object transform reset.",
         )
         return {"FINISHED"}
 
@@ -267,7 +267,7 @@ class IOPDX_OT_extract_selected_to_blend(Operator, ExportHelper):
     the current Blender session, the operator removes the selected objects
     from the scene so the user is left with the 'leftover' scene.
 
-    The current session is NOT auto-saved after removal — use Ctrl+S to
+    The current session is NOT auto-saved after removal - use Ctrl+S to
     persist. The file on disk must be saved before running (no unsaved changes).
     """
 
@@ -409,7 +409,7 @@ class IOPDX_OT_extract_selected_to_blend(Operator, ExportHelper):
 
         self.report(
             {"INFO"},
-            "Extracted {0} object(s) to '{1}'. Current scene modified — Ctrl+S to persist.".format(
+            "Extracted {0} object(s) to '{1}'. Current scene modified - Ctrl+S to persist.".format(
                 removed_count, new_path
             ),
         )
@@ -454,7 +454,7 @@ class IOPDX_PT_rigging_tools(RiggingToolsUI, Panel):
         col.label(text="Weapon alignment:")
         col.operator(
             "io_pdx_mesh.align_weapon_by_two_points",
-            text="Align by 2 verts (mid→0, front→+Y)",
+            text="Align by 2 verts (mid->0, front->+Y)",
             icon="EMPTY_AXIS",
         )
 
