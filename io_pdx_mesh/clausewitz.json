@@ -1,0 +1,13 @@
+{
+    "hearts_of_iron_4": {
+        "material": [
+            "Collision",
+            "PdxMeshAdvanced",
+            "PdxMeshAdvancedAnim",
+            "PdxMeshAdvancedSnow",
+            "PdxMeshBorder",
+            "PdxMeshSnow",
+            "PdxMeshStandard"
+        ]
+    }
+}
