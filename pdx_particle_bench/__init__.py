@@ -29,7 +29,7 @@
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 4, 2),
+    "version": (0, 5, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > PDX Blender Tools",
     "description": "Preview Clausewitz/HoI4 .asset particle effects on a real locator",
@@ -537,6 +537,10 @@ class Sim:
         self.rng = random.Random(self.seed)
         self._next_fire = 0.0
         self._fired_single = False
+        # Subsystem indices hidden from the viewport. Muting is DRAW-time only:
+        # the sim still steps them, so toggling is instant and cannot disturb the
+        # deterministic particle stream the remaining subsystems share.
+        self.muted = set()
 
     def configure(self, cfg):
         if not self.effect:
@@ -740,45 +744,50 @@ def _visual(p, s, effect):
 def oriented_quad_axes(s, axis_key, flip_yaw, flip_plume, rot3):
     """In-plane axes for a `billboard=no` quad - locked to the emitter, not the camera.
 
-    The quad's NORMAL is built from particle_yaw/particle_pitch with the same
-    formula as a velocity direction. That interpretation reproduces all of the
-    in-game behaviour recorded in the .asset comments:
-      pitch=90 -> normal is up   -> quad lies flat  (flash_secondary_h)
-      pitch=0  -> normal is side -> quad stands up  (flash_secondary_v)
-      yaw=pitch=0 -> normal is forward -> muzzle_ring faces along the shot
-    The in-plane axis at `rotation=0` is the emitter's SIDE axis projected into the
-    quad plane, falling back to the muzzle direction when side lies along the normal.
-    That single rule reproduces both measured cases:
-      normal = side (pitch=0)  -> side is degenerate -> U falls back to along the shot
-      normal = up   (pitch=90) -> U is the side axis -> across the shot at rotation=0
+    The quad is placed by a REAL rotation: yaw about the emitter's up axis, then
+    pitch about the yawed side axis. The plane normal is the rotated forward axis
+    and the in-plane axes are the other two rotated axes, so `particle_yaw` steers
+    the streak inside the plane as well as steering the plane itself.
 
-    Measured in game with a four-value rotation sweep in the pitch=90 plane: only
-    `rotation=90` ran along the shot, `rotation=0` ran across. An earlier model used
-    the muzzle direction as the default in-plane axis, which got the pitch=0 plane
-    right and the pitch=90 plane exactly 90 degrees wrong.
+      pitch=90 -> normal is up      -> quad lies flat  (flash_secondary_h)
+      pitch=0  -> normal is side    -> quad stands up  (flash_secondary_v)
+      yaw=pitch=0 -> normal is fwd  -> muzzle_ring faces down the barrel
+
+    A previous model derived only the normal from yaw/pitch and then guessed the
+    in-plane axis as "the side axis, or the muzzle axis when side is degenerate".
+    It agreed with every measurement taken on beams and was still wrong, because
+    at pitch=90 the normal formula contains cos(pitch)=0 and yaw drops out of it
+    entirely - so `particle_yaw=-90` on a flat quad became a token the preview
+    ignored. Daniil caught it on the Chimera hull bolter, whose flat plume runs
+    ALONG the barrel in game at rotation=0, while that model insisted on across.
+
+    Under a real rotation the yaw survives: at pitch=90 the in-plane U axis is
+    -fwd*sin(yaw) + right*cos(yaw), which is the side axis at yaw=0 (hence the
+    multilaser cross genuinely needing rotation=90) and the muzzle axis at
+    yaw=-90 (hence the bolter being correct at rotation=0). Both measurements,
+    one rule, no special case.
     """
     fwd, up, right = basis(axis_key)
     yaw = math.radians(s.pyaw if flip_yaw else -s.pyaw)
     pitch = math.radians(s.ppitch)
-    normal = (
-        fwd * (math.cos(pitch) * math.cos(yaw))
-        + right * (math.cos(pitch) * math.sin(yaw))
-        + up * math.sin(pitch)
-    )
-    if normal.length < 1e-6:
-        normal = fwd.copy()
-    normal.normalize()
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
 
-    # Default in-plane axis is the SIDE axis projected into the plane.
-    u = right - normal * right.dot(normal)
-    if u.length < 1e-4:
-        # Side lies along the normal, so it gives no in-plane direction. Fall back to
-        # the muzzle direction: on body-mounted locators the local forward runs
-        # tank-BACKWARD, so out of the barrel is -fwd.
-        long_axis = fwd if flip_plume else -fwd
-        u = long_axis - normal * long_axis.dot(normal)
+    # The plane normal is yawed_fwd*cp + up*sp; U and V below span that plane, so
+    # it is recoverable as U x V and is not built separately.
+    yawed_fwd = fwd * cy + right * sy
+    u = -fwd * sy + right * cy          # yawed side axis - also the pitch axis
+    v = -yawed_fwd * sp + up * cp
+
+    # The plume texture is asymmetric (bright at the muzzle end), so which way U
+    # points is visible. The sign of particle_yaw already decides it; this only
+    # exists to test the opposite convention without editing the .asset.
+    if flip_plume:
+        u = -u
+        v = -v
+
     u.normalize()
-    v = normal.cross(u)
+    v.normalize()
 
     if rot3 is not None:
         u = rot3 @ u
@@ -827,18 +836,28 @@ def draw_callback():
     gpu.state.depth_mask_set(False)
 
     for si, items in buckets.items():
+        if si in SIM.muted:
+            continue
         s = effect.subs[si]
         # Painter's order for alpha-blended smoke; additive is order-independent.
         if not s.additive:
             eye = Vector(region_3d.view_matrix.inverted().translation)
             items.sort(key=lambda it: -(it[0] - eye).length_squared)
 
-        # billboard=yes faces the camera; billboard=no is locked to the emitter.
+        # billboard=yes faces the camera. billboard=no is oriented by the emitter,
+        # but ONLY when local_space=yes. A local_space=no particle is world-referenced:
+        # the engine orients its quad by WORLD axes and ignores the locator's rotation
+        # (the locator still sets the spawn POSITION, just not the facing). Measured on
+        # the Basilisk ground shockwave - big_boom is baked 180deg-rotated, yet a
+        # pitch=90 ring lies FLAT in game and pitch=0 stands, via a temporal pitch
+        # sweep. That is only possible if the locator rotation is dropped here; applying
+        # it (as this code used to, unconditionally) inverted the plane.
         if s.billboard:
             ax_u, ax_v = cam_right, cam_up
         else:
+            rot_for_orient = emitter_rot if s.local_space else None
             ax_u, ax_v = oriented_quad_axes(
-                s, props.axis_preset, props.flip_yaw, props.flip_plume, emitter_rot
+                s, props.axis_preset, props.flip_yaw, props.flip_plume, rot_for_orient
             )
 
         coords, uvs, cols, indices = [], [], [], []
@@ -999,8 +1018,10 @@ class PPB_Props(bpy.types.PropertyGroup):
     )
     flip_plume: bpy.props.BoolProperty(
         name="Flip plume",
-        description="Long axis of a billboard=no quad points out of the barrel (-forward). "
-                    "Tick if an elongated flame ends up pointing the wrong way",
+        description="Spin a billboard=no quad 180 degrees in its own plane. The sign of "
+                    "particle_yaw already decides which end of an asymmetric plume sits "
+                    "at the muzzle; tick this to try the opposite convention without "
+                    "editing the .asset",
         default=False,
         update=_on_knob_change,
     )
@@ -1040,6 +1061,7 @@ class PPB_OT_load(bpy.types.Operator):
             self.report({"ERROR"}, "Parse failed: %s" % exc)
             return {"CANCELLED"}
         SIM.effect = effect
+        SIM.muted = set()
         _last_frame[0] = None
         update_sim(context.scene, force_reset=True)
         _tag_redraw()
@@ -1057,6 +1079,54 @@ class PPB_OT_reset(bpy.types.Operator):
     def execute(self, context):
         _last_frame[0] = None
         update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_mute_sub(bpy.types.Operator):
+    """Hide one subsystem so the rest can be read on its own.
+
+    An effect is a stack of subsystems drawn on top of each other, and a big
+    camera-facing fire mass will happily bury a thin oriented quad underneath it.
+    Without a way to take layers away, "the ring looks wrong" cannot be told apart
+    from "the ring is fine and you are looking at the fireball in front of it".
+    """
+
+    bl_idname = "pdx_pb.mute_sub"
+    bl_label = "Mute Subsystem"
+    bl_description = "Hide this subsystem in the viewport (simulation keeps running)"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        SIM.muted.symmetric_difference_update({self.index})
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_solo_sub(bpy.types.Operator):
+    bl_idname = "pdx_pb.solo_sub"
+    bl_label = "Solo Subsystem"
+    bl_description = "Show only this subsystem. Click again to show all"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        total = len(SIM.effect.subs) if SIM.effect else 0
+        others = set(range(total)) - {self.index}
+        # Already soloed -> second click restores everything.
+        SIM.muted = set() if SIM.muted == others else others
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_show_all_subs(bpy.types.Operator):
+    bl_idname = "pdx_pb.show_all_subs"
+    bl_label = "Show All"
+    bl_description = "Unmute every subsystem"
+
+    def execute(self, context):
+        SIM.muted = set()
         _tag_redraw()
         return {"FINISHED"}
 
@@ -1098,10 +1168,23 @@ class PPB_PT_panel(bpy.types.Panel):
             return
 
         box = layout.box()
-        box.label(text=effect.name, icon="PARTICLES")
-        for s in effect.subs:
+        head = box.row(align=True)
+        head.label(text=effect.name, icon="PARTICLES")
+        if SIM.muted:
+            head.operator("pdx_pb.show_all_subs", text="Show All", icon="HIDE_OFF")
+        for i, s in enumerate(effect.subs):
             row = box.row(align=True)
-            row.label(
+            hidden = i in SIM.muted
+            row.operator(
+                "pdx_pb.mute_sub",
+                text="",
+                icon="HIDE_ON" if hidden else "HIDE_OFF",
+                depress=hidden,
+            ).index = i
+            row.operator("pdx_pb.solo_sub", text="", icon="RADIOBUT_ON").index = i
+            sub = row.row(align=True)
+            sub.active = not hidden
+            sub.label(
                 text="%s  %d/%d  %s"
                 % (s.name, s.live, s.max_amount, "ADD" if s.additive else "ALPHA")
             )
@@ -1131,7 +1214,16 @@ class PPB_PT_panel(bpy.types.Panel):
         row.label(text="v{}.{}.{}".format(*bl_info["version"]))
 
 
-CLASSES = (PPB_Prefs, PPB_Props, PPB_OT_load, PPB_OT_reset, PPB_PT_panel)
+CLASSES = (
+    PPB_Prefs,
+    PPB_Props,
+    PPB_OT_load,
+    PPB_OT_reset,
+    PPB_OT_mute_sub,
+    PPB_OT_solo_sub,
+    PPB_OT_show_all_subs,
+    PPB_PT_panel,
+)
 
 
 def register():

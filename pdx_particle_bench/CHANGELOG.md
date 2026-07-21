@@ -9,6 +9,84 @@ every field either renders correctly or is explicitly documented as unsupported.
 
 ---
 
+## 0.5.0
+
+### local_space=no orientation is world-referenced
+
+**A `billboard=no` quad with `local_space=no` is oriented by WORLD axes; the locator's
+rotation is dropped for facing.** The code used to apply the locator rotation to every
+oriented quad unconditionally. That is right for `local_space=yes` (beams, muzzle flashes
+- they ride the weapon) and wrong for `local_space=no` (ground explosions - world-fixed).
+
+Caught on the Basilisk ground shockwave. Its `big_boom` locator is baked 180deg-rotated,
+so the two models disagree by exactly the plane: applying the locator rotation put the
+flat ring at `pitch=0`, dropping it puts the flat ring at `pitch=90`. A temporal pitch
+sweep in game - one ring fired at 0/45/90/135 in sequence, same spot, so no left/right
+labelling was needed - settled it: **pitch=90 lies flat, pitch=0 stands on edge.** Only
+the world-referenced model reproduces that.
+
+This one cost three wrong turns. The trap was verifying against the mesh's imported
+locator matrix, which the earlier orientation work had always fed through the locator
+rotation and which the game does not use for `local_space=no`. Lesson banked: when the
+preview disagrees with the game, the locator frame is a suspect, not an axiom.
+
+Only affects `billboard=no` + `local_space=no` subsystems (shockwave rings, and any
+directional `local_space=no` quad - the flamer flames are in this set and may want
+`local_space=yes` instead; unverified).
+
+### Orientation rule
+
+**`billboard=no` quads are placed by a real rotation, so `particle_yaw` no longer
+disappears at `particle_pitch=90`.**
+
+The previous rule derived only the quad's NORMAL from yaw/pitch, then guessed the
+in-plane axis as "the emitter's side axis, or the muzzle axis when side is degenerate".
+It agreed with every measurement taken on beams, and it was still wrong. The normal
+formula contains `cos(pitch)`, which is zero at `pitch=90`, so on a flat quad the yaw
+term vanished entirely and `particle_yaw=-90` became a token the preview silently
+ignored. The "degenerate fallback" branch existed only to paper over the information
+that had just been thrown away.
+
+Caught on the Chimera hull bolter: its flat plume runs ALONG the barrel in game at
+`rotation=0`, while the old model insisted it ran across.
+
+Yaw about the up axis, then pitch about the yawed side axis, and take the in-plane
+axes from the same rotation. At `pitch=90` the long axis is then
+`-fwd*sin(yaw) + right*cos(yaw)`, which is the side axis at `yaw=0` and the muzzle axis
+at `yaw=-90`. One rule, no special case, and it reproduces every orientation fact on
+record - the multilaser cross genuinely needing `rotation=90`, the bolter being right
+at `rotation=0`, both `flash_secondary` planes, the muzzle ring, and the ground
+shockwave.
+
+Consequence worth stating plainly: a sweep run under the old rule accused about forty
+subsystems across the mod of being written wrong. Almost all of them were correct and
+the preview was not. Under the corrected rule the only geometric outliers left are the
+lasgun and hellgun beam pairs, and those reference a pre-rotated texture that may well
+cancel the difference on screen.
+
+`Flip plume` survives as a plain 180-degree in-plane spin for testing the opposite
+convention; it is no longer load-bearing.
+
+### Per-subsystem mute and solo
+
+**Mute and solo.** The feature list already claimed this existed; it did
+not. The panel only printed each subsystem's name and live count, with no way to take a
+layer away.
+
+That gap made a whole class of question unanswerable. An effect is a stack of subsystems
+drawn over each other, and a big `billboard=yes` fire mass will bury a thin oriented quad
+completely. Looking at an artillery burst, "the shockwave ring is not lying in the ground
+plane" and "the ring is fine and you are looking at the fireball parked in front of it"
+produce the same picture. Only removing layers separates them.
+
+Each row now carries an eye toggle and a solo button; solo a second time, or use
+*Show All*, to bring everything back. Loading an effect clears the state.
+
+Muting is **draw-time only** - the simulation keeps stepping hidden subsystems. Toggling
+is therefore instant, and it cannot shift the shared deterministic particle stream, so
+what is left on screen is bit-identical to how it looked with the others visible. A mute
+that skipped the sim would silently re-roll the survivors and make the instrument lie.
+
 ## 0.4.2
 
 Warns when Blender's view transform is not **Standard**.
@@ -44,6 +122,12 @@ blend modes. For additive rendering the result is arithmetically identical to th
 path on a greyscale texture, and only differs where a texture is actually tinted.
 
 ## 0.4.0
+
+> **Superseded by 0.5.0.** The rule below is right for every case it was tested on and
+> wrong in general: all of its probes used `particle_yaw=0`, the one value at which the
+> missing yaw term makes no difference. Keep the measurements, discard the model. The
+> "consequence for existing effects" section below is likewise void - `pitch=90
+> rotation=0` is correct whenever `particle_yaw=-90`.
 
 **`billboard=no` orientation now matches the game.**
 
@@ -139,7 +223,11 @@ Initial Blender port of a simulation previously validated in a browser prototype
 
 - `ENGINE_EMISSION_MUL` rests on one effect's worth of evidence and should be re-measured
   on others.
-- The `position` and force `direction` axis mappings differ from each other. Each is backed
-  by its own measurements, but the asymmetry is unexplained and deserves a dedicated probe.
+- The `position` and force `direction` axis mappings differ from each other - position
+  `(x,y,z)->(forward,up,right)`, force `->(right,up,forward)`, an X/Z swap. CONFIRMED real
+  in game (2026-07-20) by a side-by-side probe: a static position marker and a force-driven
+  trail on the same asset axis came out perpendicular, with the up axis agreeing as a
+  control. So the bench is right to map them differently; the mechanism is most likely the
+  io_pdx_mesh SPACE_MATRIX Y/Z swap. Not a bug, just a documented quirk.
 - Texture atlases (`texture` `x`/`y` greater than 1) are not animated.
 - Viewport only - this is a measuring instrument, not a render path.
