@@ -9,6 +9,101 @@ every field either renders correctly or is explicitly documented as unsupported.
 
 ---
 
+## 0.5.1 - finished the measuring layer
+
+Every simulation constant was re-checked in game against a purpose-built **calibration
+ruler** (concentric rings r=1..10, particles fired from a centre locator, read against the
+rings). All confirmed 1:1 except emission, corrected
+below. velocity, planar force (accel u/s^2), friction (exp decay, terminal v/amount), size
+(world units), and symmetric `{ base spread }` all read exactly as the bench predicts.
+
+### Round-trip a model into a bench-ready file (button)
+
+New **Round-trip model for Bench** button at the top of the panel. It exports the selected
+model through io_pdx_mesh and re-imports it into a fresh empty file - the exact coordinate
+state the bench is calibrated for - so you can author particles on a model you just built
+without hand-running export then import each time. Because the bench's conventions (emitter
+`-fwd`, the yaw mirror, `matrix_world` for position/orientation) were all measured against
+the io_pdx_mesh-imported state, replaying the real pipeline is correct by construction,
+rather than re-deriving those conventions for Blender's authoring space.
+
+It REPLACES the current session with the import, so it refuses to run unless the `.blend` is
+saved and clean - the original file on disk is left untouched. Rather than a bespoke file
+picker it hands off to **io_pdx_mesh's own export dialog** (with its selected / skeleton /
+locators checkboxes); since another operator's modal dialog gives no completion callback, it
+watches io_pdx_mesh's recorded `last_export_mesh` and, once that points to a file freshly
+written, swaps to a fresh empty file and imports it. io_pdx_mesh (its settings +
+`import_meshfile`) is located by scanning `sys.modules`, so it works whether io_pdx_mesh is a
+legacy add-on (`io_pdx_mesh`) or a Blender 4.2+ extension (`bl_ext.*.io_pdx_mesh`) - a
+hard-coded `import io_pdx_mesh` fails for the latter. The file swap runs from a timer so it
+cannot invalidate the operator's context, and the import itself runs on the next tick under a
+VIEW_3D `temp_override`: `import_meshfile`'s internal ops (`mode_set` to add bones, `join` for
+multi-material meshes) silently no-op from a bare timer context, which otherwise left an empty
+rig and no mesh.
+
+### emission: `ENGINE_EMISSION_MUL` is 1, not 3
+
+**`emission` is a literal particles/second - no engine multiplier.** The old value of 3
+was `ENGINE_EMISSION_MUL`'s single-effect measurement, taken on a rapid-fire weapon whose
+asset SPAMS many events per second; that event-spam was the "3x", not any per-subsystem
+rate. The ruler isolates it: one continuous emitter at emission=1, life=2 held ~2 particles
+in game (= rate x life x 1). So the bench had been spawning 3x too many particles per
+subsystem; it now matches the game. Reach/size/direction were never affected - only density.
+
+### Scene-background preview
+
+A **Scene background** luminance slider (Display section). At 0 the viewport stays dark, so
+every faint additive layer is visible - good for authoring. Raise it and ADDITIVE effects
+are judged against a grey base, the way the game composites them over terrain: a dim
+additive layer that dominates on black nearly vanishes on grey. The mod's terrain is a
+fairly grey city, so ~0.3-0.4 fits it; 0.6+ already reads near-white.
+
+Explicitly an APPROXIMATION - the panel and README now say so. The bench cannot match HoI4
+pixel for pixel (a different, older engine with its own blend/tonemap), and does not try to;
+it is calibrated for behaviour and proportion, not colour-exact reproduction.
+
+This closes the gap the fire_explosion episode exposed. The Basilisk ground fireball (dim
+brown, 160,110,70) read as a giant fireball on the dark viewport yet is nearly invisible in
+game, washed out by the bright scene - nothing wrong with the effect or the sim, the viewport
+background was lying. Deleting or brightening such a layer is now a decision you can make in
+the bench instead of only in game.
+
+Implementation: a full-screen grey quad at the far depth plane, LESS_EQUAL with no depth
+write, so it fills only the empty background and leaves the emitter mesh visible. A LINEAR
+approximation, not the engine's exact tonemap - enough to judge relative prominence, not to
+colour-match.
+
+### Simpler panel - calibration knobs removed
+
+The `world scale`, `force`, `friction`, `emission`, and `size gain` multipliers, the
+`flip yaw` / `flip plume` toggles, and the `spread` mode are gone from the UI. They existed
+to DISCOVER the engine's conventions; now that the ruler pass pinned all of them (all 1:1,
+spread symmetric, yaw negated), they are fixed in code and would only confuse a user. What
+remains is what a user actually sets: the .asset, the locator, the mesh's axis convention,
+optional refire, and the scene-background preview.
+
+### The emitter forward is -fwd - it is HoI4's convention, not our pipeline
+
+Mid-cycle the hardcoded `-fwd` emitter forward was reframed as a Kaurava-pipeline quirk (every
+mesh node rotated 180deg about Z) and moved behind a **Mesh nodes rotated 180deg about Z**
+preference, defaulting to `+fwd`. An in-game test refuted that: an `emitter_yaw=0` stream fired
+from a muzzle node whose 180deg-Z rotation had been REMOVED still sprayed backward, into the
+tank. So HoI4 fires `emitter_yaw=0` along the locator's local -Y (= `-fwd`) universally - it is
+the engine's convention, independent of how the nodes were built.
+
+The preference is removed and `-fwd` is hardcoded again. Position and orientation ride the
+mesh's real `matrix_world` and never needed a flip; the 180deg-Z rotation only ever affected
+those, and matrix_world already carries it. So a normal (non-rotated) mesh works with the same
+`-fwd` - nothing to toggle.
+
+### Convenience: Browse opens in the right folder
+
+A **Browse** button next to the asset field opens the file dialog straight in the mod's
+`gfx/particles` (from the Mod root preference), instead of wherever the OS last left it -
+and loads the pick immediately. A **Browse from vanilla particles** preference switches the
+starting folder to the vanilla game's `gfx/particles` (texture resolution, mod-first then
+vanilla, is unchanged). The asset field is still a plain text box, so a path can be pasted.
+
 ## 0.5.0
 
 ### local_space=no orientation is world-referenced
@@ -221,8 +316,6 @@ Initial Blender port of a simulation previously validated in a browser prototype
 
 ## Known limitations
 
-- `ENGINE_EMISSION_MUL` rests on one effect's worth of evidence and should be re-measured
-  on others.
 - The `position` and force `direction` axis mappings differ from each other - position
   `(x,y,z)->(forward,up,right)`, force `->(right,up,forward)`, an X/Z swap. CONFIRMED real
   in game (2026-07-20) by a side-by-side probe: a static position marker and a force-driven

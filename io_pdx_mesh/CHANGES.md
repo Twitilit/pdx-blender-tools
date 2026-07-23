@@ -116,3 +116,18 @@ it would still appear to be supported. Upstream remains the place to get Maya su
 The file feeds the engine dropdown in the UI directly, so the list is now a single
 entry and HoI4 is the default rather than `standard_previewer`. Anyone needing another
 title can restore its block from upstream's `clausewitz.json` - the format is unchanged.
+
+## 8. Textures resolved across the whole models/ tree
+
+`pdx_blender/blender_import_export.py`, `create_node_texture()` + new `_resolve_texture_in_models()`
+
+Upstream looks for each texture at exactly `texture_dir/<filename>` - the directory of
+the imported `.mesh`. HoI4 meshes bake in texture filenames that often live in a SHARED
+model subfolder (e.g. one `specular.dds` reused by many vehicles), not next to the mesh,
+so the literal path misses and upstream just shows a red placeholder node.
+
+Added a fallback: when the exact path is missing, search by filename under the nearest
+`models` ancestor of the path. The tree is indexed once per models root and cached, so
+many textures cost a single `os.walk`, not one per texture (the Kaurava mod's ~335-file
+models tree indexes in ~2 ms). Existing paths and non-`models` paths pass through
+unchanged.

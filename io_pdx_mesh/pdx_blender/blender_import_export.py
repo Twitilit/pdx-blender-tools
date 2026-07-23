@@ -627,10 +627,37 @@ def swap_coord_space(data, space_mat=SPACE_MATRIX, space_mat_inv=SPACE_MATRIX_IN
 """
 
 
+# FORK: resolve a missing texture by searching the whole models/ tree by filename.
+# HoI4 meshes bake texture filenames that often live in a SHARED model subfolder, not
+# next to the .mesh, so the literal texture_dir path frequently misses and upstream just
+# shows a red placeholder. Here we fall back to a filename search under the nearest
+# 'models' ancestor. The tree is indexed once per models root and cached, so many
+# textures cost a single walk, not one per texture.
+_PDX_TEX_INDEX = {}
+
+
+def _resolve_texture_in_models(tex_filepath):
+    if not tex_filepath or os.path.isfile(tex_filepath):
+        return tex_filepath
+    parts = os.path.dirname(os.path.abspath(tex_filepath)).replace("\\", "/").split("/")
+    if "models" not in parts:
+        return tex_filepath
+    models_root = "/".join(parts[: len(parts) - parts[::-1].index("models")])
+    index = _PDX_TEX_INDEX.get(models_root)
+    if index is None:
+        index = {}
+        for dirpath, _dirs, files in os.walk(models_root):
+            for fn in files:
+                index.setdefault(fn.lower(), os.path.join(dirpath, fn))
+        _PDX_TEX_INDEX[models_root] = index
+    return index.get(os.path.basename(tex_filepath).lower(), tex_filepath)
+
+
 def create_node_texture(node_tree, tex_filepath, as_data=False):
     teximage_node = node_tree.nodes.new("ShaderNodeTexImage")
 
     if tex_filepath is not None:
+        tex_filepath = _resolve_texture_in_models(tex_filepath)  # FORK: models-wide search
         texture_name = os.path.basename(tex_filepath)
 
         try:

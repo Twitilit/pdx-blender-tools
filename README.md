@@ -80,6 +80,17 @@ Rendering uses Blender's `gpu` module rather than EEVEE materials - the only way
 true additive blending, which most of these effects rely on. It is viewport-only by
 design: a measuring instrument, not a render path.
 
+It does **not** promise a pixel-exact match with the game, and by design cannot. What is
+calibrated is the *simulation*: a particle's position, velocity, size, count, lifetime,
+direction and timing all match the game 1:1. What it cannot reproduce is the game's
+*presentation* - HoI4 composites each effect into an already-lit scene and then runs the
+whole frame through post-processing (HDR tonemapping, bloom, colour-grading LUTs, fog), so
+an additive layer's on-screen colour depends on the tonemapped terrain behind it and the
+bloom around it, none of which exist in an isolated preview. The bench draws effects on
+their own through the `gpu` module's additive blend, with Blender's own view transform on
+top. Replicating that pipeline is out of scope: the bench measures what an effect *does*,
+not the exact pixels it resolves to on screen.
+
 Version history and the full list of known limitations:
 [`pdx_particle_bench/CHANGELOG.md`](pdx_particle_bench/CHANGELOG.md). The running
 version is shown at the bottom of the add-on's panel - worth checking, since this

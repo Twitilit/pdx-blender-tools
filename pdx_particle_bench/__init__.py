@@ -8,7 +8,7 @@
 # velocity -> world units 1:1, planar force = acceleration in units/s^2, friction
 # = exponential decay, size = quad size in world units, real time, and
 # `{base spread}` random ranges are SYMMETRIC +/-. The one deviation found is
-# ENGINE_EMISSION_MUL below. See README.md for how each was pinned down.
+# ENGINE_EMISSION_MUL below. See CHANGELOG.md.
 #
 # Why in Blender: a mesh-less preview structurally cannot show
 #   * attachment to a real locator,
@@ -29,7 +29,7 @@
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > PDX Blender Tools",
     "description": "Preview Clausewitz/HoI4 .asset particle effects on a real locator",
@@ -40,6 +40,7 @@ import math
 import os
 import random
 import re
+import time
 
 import bpy
 import gpu
@@ -48,10 +49,13 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 # --- calibrated engine constant ---------------------------------------------
-# The engine spawns ~3x more particles than a literal "emission = particles/sec"
-# reading. Measured on a rapid-fire hull weapon effect, using its spark and smoke
-# subsystems. Provisional: one effect's worth of evidence - re-measure on others.
-ENGINE_EMISSION_MUL = 3.0
+# `emission` is a literal particles/second - the engine applies NO multiplier.
+# Re-measured 2026-07-21 on the calibration ruler: a single continuous emitter with
+# emission=1, life=2 held ~2 particles in game (= rate x life x 1), so the multiplier
+# is 1. The earlier value of 3 came from a rapid-fire weapon whose ASSET spams many
+# events per second; that event-spam, not any per-subsystem multiplier, was the "3x".
+# A clean single-event test isolates the true rate.
+ENGINE_EMISSION_MUL = 1.0
 
 FIXED_DT = 1.0 / 120.0
 MAX_STEPS_PER_UPDATE = 4000
@@ -474,10 +478,11 @@ class Instance:
         )
         speed = s.vel_b + _spread(s.vel_s, mode, rng)
 
-        # emitter_yaw/pitch are measured from the direction the weapon FIRES, which is
-        # -fwd: on body-mounted locators the local forward runs tank-BACKWARD, so a
-        # yaw=0 emitter built on +fwd sprays out of the vehicle's rear. This is the
-        # same -fwd the billboard=no plume uses, so flame and quad now agree.
+        # HoI4 fires emitter_yaw=0 along the locator's local -Y - i.e. -fwd in axis-preset
+        # terms, NOT +Y. Verified in game 2026-07-21: an emitter_yaw=0 stream on a muzzle
+        # node whose 180deg-Z rotation had been REMOVED still fired backward, so -fwd is the
+        # engine's convention, not a side effect of the mod's rotated-node pipeline. Position
+        # and orientation ride the mesh's real matrix_world and need no such flip.
         muzzle = -fwd
         direction = (
             muzzle * (math.cos(pitch) * math.cos(yaw))
@@ -723,6 +728,50 @@ def get_shader(textured):
     return _shader_proc
 
 
+VERT_BG = """
+in vec2 pos;
+/* z just inside the far plane (not exactly 1.0, which some drivers clip), so the quad
+   sits behind the mesh but still passes LESS_EQUAL against the cleared far depth. */
+void main() { gl_Position = vec4(pos, 0.9999, 1.0); }
+"""
+
+FRAG_BG = """
+uniform vec4 color;
+out vec4 fragColor;
+void main() { fragColor = color; }
+"""
+
+_shader_bg = None
+
+
+def get_bg_shader():
+    global _shader_bg
+    if _shader_bg is None:
+        _shader_bg = gpu.types.GPUShader(VERT_BG, FRAG_BG)
+    return _shader_bg
+
+
+def _draw_background(lum):
+    """Fill only the EMPTY background (not the emitter mesh) with a flat grey, so
+    ADDITIVE effects can be judged against a bright in-game scene rather than the dark
+    default viewport.
+
+    Drawn at the far plane with LESS_EQUAL depth and no depth write, so it passes only
+    where the scene left the cleared far depth - the mesh stays visible. A LINEAR stand
+    in for the game's bright, tonemapped terrain: enough to show that a dim additive
+    layer which dominates on black nearly vanishes on grey. It is not the engine's exact
+    tonemap curve.
+    """
+    shader = get_bg_shader()
+    batch = batch_for_shader(shader, "TRI_FAN", {"pos": [(-1, -1), (1, -1), (1, 1), (-1, 1)]})
+    gpu.state.blend_set("NONE")
+    gpu.state.depth_test_set("LESS_EQUAL")
+    gpu.state.depth_mask_set(False)
+    shader.bind()
+    shader.uniform_float("color", (lum, lum, lum, 1.0))
+    batch.draw(shader)
+
+
 def _visual(p, s, effect):
     """size and alpha after the animation curves, exactly as the web Bench."""
     u = min(max(p.age / p.life, 0.0), 1.0)
@@ -808,13 +857,15 @@ def draw_callback():
     region_3d = ctx.region_data
     if region_3d is None:
         return
+    if props.bg_luminance > 0.0:
+        _draw_background(props.bg_luminance)
     view_mat = region_3d.view_matrix
     cam_right = Vector((view_mat[0][0], view_mat[0][1], view_mat[0][2]))
     cam_up = Vector((view_mat[1][0], view_mat[1][1], view_mat[1][2]))
 
     emitter_mat = props.target.matrix_world if props.target else None
     emitter_rot = emitter_mat.to_3x3() if emitter_mat else None
-    size_gain = props.size_gain
+    size_gain = 1.0  # size is world units 1:1 (calibrated); no user knob
 
     # Bucket by subsystem so each can use its own blend mode.
     buckets = {}
@@ -857,7 +908,7 @@ def draw_callback():
         else:
             rot_for_orient = emitter_rot if s.local_space else None
             ax_u, ax_v = oriented_quad_axes(
-                s, props.axis_preset, props.flip_yaw, props.flip_plume, rot_for_orient
+                s, props.axis_preset, False, False, rot_for_orient
             )
 
         coords, uvs, cols, indices = [], [], [], []
@@ -897,15 +948,18 @@ _last_frame = [None]
 
 
 def _cfg(props):
+    # world/force/friction/emission are calibrated at 1:1, spread is symmetric, yaw is
+    # negated, and the emitter forward is -fwd - all measured against the game, so they are
+    # fixed here rather than exposed as knobs that would only confuse. (See CHANGELOG.md.)
     return {
-        "world": props.world_scale,
-        "force": props.force_scale,
-        "friction": props.friction_scale,
-        "emission": props.emission_scale,
-        "spread": props.spread_mode,
+        "world": 1.0,
+        "force": 1.0,
+        "friction": 1.0,
+        "emission": 1.0,
+        "spread": "SYM",
         "refire": props.refire_frames,
         "axis": props.axis_preset,
-        "flip_yaw": props.flip_yaw,
+        "flip_yaw": False,
     }
 
 
@@ -954,6 +1008,11 @@ def _on_knob_change(self, context):
     _tag_redraw()
 
 
+def _on_display_change(self, context):
+    # Pure viewport change - no need to re-simulate, just repaint.
+    _tag_redraw()
+
+
 def _on_root_change(self, context):
     clear_texture_cache()
 
@@ -973,11 +1032,18 @@ class PPB_Prefs(bpy.types.AddonPreferences):
         subtype="DIR_PATH",
         update=_on_root_change,
     )
+    browse_vanilla: bpy.props.BoolProperty(
+        name="Browse from vanilla particles",
+        description="Open the .asset Browse dialog in the VANILLA game's gfx/particles instead "
+                    "of the mod's. Texture resolution (mod first, then vanilla) is unaffected",
+        default=False,
+    )
 
     def draw(self, context):
         col = self.layout.column()
         col.prop(self, "mod_root")
         col.prop(self, "vanilla_root")
+        col.prop(self, "browse_vanilla")
         col.label(
             text="Texture paths in .asset resolve against the mod first, then vanilla.",
             icon="INFO",
@@ -986,7 +1052,7 @@ class PPB_Prefs(bpy.types.AddonPreferences):
 
 class PPB_Props(bpy.types.PropertyGroup):
     asset_path: bpy.props.StringProperty(
-        name="Asset", description="HoI4 particle .asset file", subtype="FILE_PATH"
+        name="Asset", description="HoI4 particle .asset file (use Browse, or paste a path)"
     )
     target: bpy.props.PointerProperty(
         name="Locator",
@@ -997,7 +1063,8 @@ class PPB_Props(bpy.types.PropertyGroup):
 
     axis_preset: bpy.props.EnumProperty(
         name="Axes",
-        description="Which local axis the emitter fires along (flip until the jet points right)",
+        description="Which local axis is your mesh's forward/up. The emitter direction and "
+                    "billboard=no quads are oriented relative to it. Kaurava meshes are +Y fwd",
         items=[
             ("Y_FWD_Z_UP", "+Y fwd, +Z up", ""),
             ("NEG_Y_FWD_Z_UP", "-Y fwd, +Z up", ""),
@@ -1008,39 +1075,47 @@ class PPB_Props(bpy.types.PropertyGroup):
         default="Y_FWD_Z_UP",
         update=_on_knob_change,
     )
-    flip_yaw: bpy.props.BoolProperty(
-        name="Flip yaw",
-        description="Yaw is negated by default to undo the mirror in io_pdx_mesh's "
-                    "SPACE_MATRIX (determinant -1). Tick to restore the raw sign if a "
-                    "mount disagrees",
-        default=False,
-        update=_on_knob_change,
-    )
-    flip_plume: bpy.props.BoolProperty(
-        name="Flip plume",
-        description="Spin a billboard=no quad 180 degrees in its own plane. The sign of "
-                    "particle_yaw already decides which end of an asymmetric plume sits "
-                    "at the muzzle; tick this to try the opposite convention without "
-                    "editing the .asset",
-        default=False,
-        update=_on_knob_change,
-    )
-    spread_mode: bpy.props.EnumProperty(
-        name="Spread",
-        items=[("SYM", "symmetric +/-", ""), ("ONE", "one-sided 0..+", "")],
-        default="SYM",
-        update=_on_knob_change,
-    )
     refire_frames: bpy.props.IntProperty(
         name="Refire", description="Re-fire every N frames (0 = single shot)",
         default=0, min=0, max=120, update=_on_knob_change,
     )
 
-    world_scale: bpy.props.FloatProperty(name="World scale", default=1.0, min=0.0, soft_max=3.0, update=_on_knob_change)
-    force_scale: bpy.props.FloatProperty(name="Force", default=1.0, min=0.0, soft_max=3.0, update=_on_knob_change)
-    friction_scale: bpy.props.FloatProperty(name="Friction", default=1.0, min=0.0, soft_max=3.0, update=_on_knob_change)
-    emission_scale: bpy.props.FloatProperty(name="Emission", default=1.0, min=0.0, soft_max=6.0, update=_on_knob_change)
-    size_gain: bpy.props.FloatProperty(name="Size gain", default=1.0, min=0.01, soft_max=4.0)
+    bg_luminance: bpy.props.FloatProperty(
+        name="Scene background",
+        description="Fill the empty background with a flat grey of this luminance to judge how "
+                    "ADDITIVE effects read against the game's scene instead of a black viewport. "
+                    "0 = dark (every faint additive layer shows). The mod's terrain is fairly grey "
+                    "city, so ~0.3-0.4 matches it; 0.6+ already reads near-white. A linear "
+                    "approximation, not the engine's exact tonemap - it will not match the game "
+                    "pixel for pixel.",
+        default=0.0, min=0.0, max=1.0, update=_on_display_change,
+    )
+
+
+class PPB_OT_browse(bpy.types.Operator):
+    bl_idname = "pdx_pb.browse"
+    bl_label = "Browse"
+    bl_description = (
+        "Pick a particle .asset and load it. The dialog opens in the mod's gfx/particles "
+        "(or the vanilla game's, if 'Browse from vanilla particles' is ticked in Preferences)"
+    )
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.asset", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        prefs = get_prefs()
+        if prefs:
+            base = prefs.vanilla_root if prefs.browse_vanilla else prefs.mod_root
+            if base:
+                start = os.path.join(bpy.path.abspath(base), "gfx", "particles")
+                if os.path.isdir(start):
+                    self.filepath = start + os.sep
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        context.scene.pdx_pb.asset_path = self.filepath
+        return bpy.ops.pdx_pb.load()
 
 
 class PPB_OT_load(bpy.types.Operator):
@@ -1131,6 +1206,114 @@ class PPB_OT_show_all_subs(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _find_pdx():
+    # io_pdx_mesh may be a legacy add-on ("io_pdx_mesh") or a Blender 4.2+ extension
+    # ("bl_ext.<repo>.io_pdx_mesh"), so a hard-coded `import io_pdx_mesh` fails for the
+    # extension. Find the already-loaded modules by name-tail instead. Returns
+    # (blender_import_export module, io_pdx top-level module); either may be None.
+    import sys
+
+    bie = top = None
+    for name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if name.endswith("pdx_blender.blender_import_export") and hasattr(mod, "import_meshfile"):
+            bie = mod
+        if (name == "io_pdx_mesh" or name.endswith(".io_pdx_mesh")) and hasattr(mod, "IO_PDX_SETTINGS"):
+            top = mod
+    return bie, top
+
+
+def _import_in_view3d(meshpath, import_meshfile):
+    # import_meshfile runs bpy.ops internally (mode_set to enter edit mode for bones, join
+    # for multi-material meshes). A bare timer callback has no VIEW_3D context, so those
+    # ops quietly no-op - leaving an empty rig and no mesh. Run under a temp_override onto
+    # the first VIEW_3D area so they behave as they do from the UI.
+    override = None
+    for win in bpy.context.window_manager.windows:
+        area = next((a for a in win.screen.areas if a.type == "VIEW_3D"), None)
+        if area is not None:
+            override = {"window": win, "area": area}
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            if region is not None:
+                override["region"] = region
+            break
+    try:
+        if override is not None:
+            with bpy.context.temp_override(**override):
+                import_meshfile(meshpath)
+        else:
+            import_meshfile(meshpath)
+    except Exception as exc:  # no operator context here - log to console
+        print("[PDX Particle Bench] round-trip import failed:", exc)
+    return None
+
+
+class PPB_OT_roundtrip(bpy.types.Operator):
+    bl_idname = "pdx_pb.roundtrip"
+    bl_label = "Round-trip model for Bench"
+    bl_description = (
+        "Open io_pdx_mesh's own export dialog (its selected / skeleton / locators options), "
+        "then re-import the exported .mesh into a NEW empty file - the exact coordinate "
+        "state the Bench is calibrated for, so you can author particles on a model you just "
+        "built. REPLACES the session with the import; your original .blend on disk is left "
+        "untouched, so save it (Ctrl+S) first"
+    )
+
+    def invoke(self, context, event):
+        bie, top = _find_pdx()
+        if bie is None or top is None:
+            self.report({"ERROR"}, "io_pdx_mesh add-on not found - is it enabled?")
+            return {"CANCELLED"}
+        # Require the .blend saved and clean, so nothing a .mesh export cannot carry
+        # (modifiers, extra objects, edit history) is lost when the session is replaced.
+        if not bpy.data.filepath or bpy.data.is_dirty:
+            self.report(
+                {"ERROR"},
+                "Save your .blend first (Ctrl+S) - round-trip replaces this session with the import.",
+            )
+            return {"CANCELLED"}
+
+        settings = top.IO_PDX_SETTINGS
+        import_meshfile = bie.import_meshfile
+        prev = getattr(settings, "last_export_mesh", "") or ""
+        prev_mtime = os.path.getmtime(prev) if prev and os.path.isfile(prev) else -1.0
+        t0 = time.time()
+
+        # Hand off to io_pdx_mesh's real export dialog (its own options). Another operator's
+        # modal dialog gives no completion callback, so watch the path it records in
+        # last_export_mesh: once that points to a file freshly written since we started, the
+        # export succeeded -> swap to a fresh file and import it.
+        bpy.ops.io_pdx_mesh.export_mesh("INVOKE_DEFAULT")
+
+        def _await_export():
+            if time.time() - t0 > 300.0:
+                return None  # user likely cancelled the dialog - stop watching
+            cur = getattr(settings, "last_export_mesh", "") or ""
+            if cur and os.path.isfile(cur):
+                try:
+                    mtime = os.path.getmtime(cur)
+                except OSError:
+                    return 0.5
+                if mtime >= t0 - 2.0 and (cur != prev or mtime > prev_mtime):
+                    path = cur
+                    bpy.ops.wm.read_homefile(use_empty=True)
+                    # Import on the NEXT tick (let the fresh file settle) and under a
+                    # VIEW_3D override, so import_meshfile's internal ops actually run.
+                    bpy.app.timers.register(
+                        lambda: _import_in_view3d(path, import_meshfile),
+                        first_interval=0.1,
+                    )
+                    return None
+            return 0.5
+
+        bpy.app.timers.register(_await_export, first_interval=0.5)
+        self.report(
+            {"INFO"}, "Export dialog open - a fresh file with the import follows once you export."
+        )
+        return {"FINISHED"}
+
+
 class PPB_PT_panel(bpy.types.Panel):
     bl_label = "Particle Bench"
     bl_idname = "PPB_PT_panel"
@@ -1154,8 +1337,14 @@ class PPB_PT_panel(bpy.types.Panel):
             layout.label(text="Colour is tone-mapped by view transform", icon="INFO")
             layout.label(text="Render > Color Management > Standard to compare")
 
+        row = layout.row(align=True)
+        row.operator("pdx_pb.roundtrip", icon="IMPORT")
+        layout.separator()
+
         col = layout.column(align=True)
-        col.prop(props, "asset_path", text="")
+        row = col.row(align=True)
+        row.prop(props, "asset_path", text="")
+        row.operator("pdx_pb.browse", text="", icon="FILEBROWSER")
         col.prop(props, "target", text="Locator")
         row = layout.row(align=True)
         row.operator("pdx_pb.load", icon="FILE_REFRESH")
@@ -1193,17 +1382,16 @@ class PPB_PT_panel(bpy.types.Panel):
             layout.label(text=msg, icon="ERROR")
 
         box = layout.box()
-        box.label(text="Engine constants (calibrated =1)")
-        box.prop(props, "world_scale")
-        box.prop(props, "force_scale")
-        box.prop(props, "friction_scale")
-        box.prop(props, "emission_scale")
-        box.prop(props, "size_gain")
-        box.prop(props, "spread_mode")
         box.prop(props, "axis_preset")
-        box.prop(props, "flip_yaw")
-        box.prop(props, "flip_plume")
         box.prop(props, "refire_frames")
+
+        box = layout.box()
+        box.label(text="Display (preview only, not simulated)")
+        box.prop(props, "bg_luminance", slider=True)
+        note = box.column(align=True)
+        note.scale_y = 0.72
+        note.label(text="Approximation, not an exact game match", icon="INFO")
+        note.label(text="(different, older engine + render pipeline).")
 
         # Which build is actually running. This add-on tends to exist in several
         # copies at once (repo, Blender's addons dir, a mod's tools folder), and
@@ -1217,11 +1405,13 @@ class PPB_PT_panel(bpy.types.Panel):
 CLASSES = (
     PPB_Prefs,
     PPB_Props,
+    PPB_OT_browse,
     PPB_OT_load,
     PPB_OT_reset,
     PPB_OT_mute_sub,
     PPB_OT_solo_sub,
     PPB_OT_show_all_subs,
+    PPB_OT_roundtrip,
     PPB_PT_panel,
 )
 
