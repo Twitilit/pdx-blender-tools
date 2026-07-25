@@ -1,0 +1,28 @@
+{
+    "_readme": [
+        "Engine constants for the PDX Particle Bench. Edit, then press Restart (or Load",
+        ".asset) in the panel - no need to reload the add-on.",
+        "",
+        "MEASURED: read off the calibration ruler in game. These are facts about the engine,",
+        "not preferences - changing one makes the preview disagree with HoI4. They live here",
+        "so they are visible and auditable, not because they are meant to be adjusted.",
+        "",
+        "FITTED: approximations matched by eye against the game, because the behaviour is",
+        "chaotic or too subtle to measure. These are the ones worth tuning if your own",
+        "reading of the game differs from ours - how each was arrived at is in CHANGELOG.md.",
+        "",
+        "Anything missing or malformed falls back to the built-in value, so a broken file",
+        "cannot stop the add-on working - it just prints a warning."
+    ],
+
+    "measured": {
+        "emission_multiplier": 1.0
+    },
+
+    "fitted": {
+        "vortex_swirl": 0.09,
+        "turbulence_rate": 8.0,
+        "turbulence_interval_jitter": 0.75,
+        "turbulence_per_particle": 0.1
+    }
+}

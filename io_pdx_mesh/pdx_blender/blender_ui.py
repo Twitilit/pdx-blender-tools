@@ -740,10 +740,8 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
     panel_order = 0
 
     def draw(self, context):
-        # FORK: the upstream auto-update check was removed. It offered a one-click
-        # "UPDATE" button pointing at upstream releases, which would have replaced
-        # this fork with v0.91 - the version whose Blender 4.x bugs this fork fixes.
-        # Removing it also drops the network call on panel draw.
+        # FORK: removed the upstream auto-update check - its "UPDATE" button would
+        # replace this fork with upstream v0.91 (and it made a network call on draw).
         self.layout.label(
             text="PDX Blender Tools - v{} (fork)".format(IO_PDX_INFO["version"]), icon="TOOL_SETTINGS"
         )

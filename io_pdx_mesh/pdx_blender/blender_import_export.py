@@ -627,12 +627,9 @@ def swap_coord_space(data, space_mat=SPACE_MATRIX, space_mat_inv=SPACE_MATRIX_IN
 """
 
 
-# FORK: resolve a missing texture by searching the whole models/ tree by filename.
-# HoI4 meshes bake texture filenames that often live in a SHARED model subfolder, not
-# next to the .mesh, so the literal texture_dir path frequently misses and upstream just
-# shows a red placeholder. Here we fall back to a filename search under the nearest
-# 'models' ancestor. The tree is indexed once per models root and cached, so many
-# textures cost a single walk, not one per texture.
+# FORK: fall back to a filename search under the nearest 'models' ancestor when a
+# baked texture path misses (HoI4 meshes often reference a shared model subfolder, not
+# a file beside the .mesh). The tree is indexed once per models root and cached.
 _PDX_TEX_INDEX = {}
 
 

@@ -1,19 +1,12 @@
 """
-Rigging helpers added to the io_pdx_mesh Blender addon by this fork.
-
-General-purpose operators for preparing Paradox/Clausewitz assets.
-They live in their own module so the fork's
-additions stay isolated from upstream code and easy to diff.
+Rigging helpers added to the io_pdx_mesh addon by this fork - general operators for
+preparing Paradox/Clausewitz assets, kept in their own module to stay easy to diff
+against upstream. Shown in the "Rigging tools" sidebar panel (N).
 
     Orient bone to 3D cursor      point a bone's tail at the 3D cursor
     Flip bone (swap head/tail)    swap head/tail, preserving roll
     Align weapon by 2 points      midpoint -> origin, front point -> +Y
     Extract selected to .blend    split selection into a separate .blend
-
-UI: "Rigging tools" panel in the 3D view sidebar (N), category "PDX Blender Tools".
-
-Requires the matching import in pdx_blender/__init__.py (marked "# FORK:").
-See ../CHANGES.md for the full list of fork modifications.
 
 Part of io_pdx_mesh, GPL-3.0-or-later. Upstream addon (C) ross-g.
 """
@@ -30,9 +23,7 @@ from mathutils import Matrix, Vector  # type: ignore
 
 EPSILON = 1e-6
 
-# Timeout for the background Blender subprocess that extracts objects.
-# Typical run is 2-5 seconds; 60s is a generous ceiling that catches hangs
-# without annoying users when a model is unusually large.
+# Ceiling for the background extract subprocess (typical run is 2-5s).
 EXTRACT_SUBPROCESS_TIMEOUT_SEC = 60
 
 
@@ -43,12 +34,7 @@ EXTRACT_SUBPROCESS_TIMEOUT_SEC = 60
 
 
 class IOPDX_OT_orient_bone_to_cursor(Operator):
-    """Orient the active armature bone so its tail points toward the 3D cursor.
-
-    Used when roughly aligning a hand/weapon bone before a weapon mesh is ready.
-    The bone's head stays in place; its tail is moved along the direction
-    head -> 3D cursor, preserving the bone's current length. Roll is not changed.
-    """
+    """Point the active bone's tail at the 3D cursor; head and length unchanged."""
 
     bl_idname = "io_pdx_mesh.orient_bone_to_cursor"
     bl_label = "Orient bone to 3D cursor"
@@ -99,19 +85,9 @@ class IOPDX_OT_orient_bone_to_cursor(Operator):
 
 
 class IOPDX_OT_flip_bone_head_tail(Operator):
-    """Swap head and tail of selected armature bones, preserving roll.
-
-    HoI4 vanilla convention is bone head on +Y side of armature (so bone.tail
-    points in the soldier's forward direction, -Y world). Weapons are modeled
-    along -Y. Our older pipeline used the opposite convention. This operator
-    flips bones in-place so we can migrate to vanilla convention without
-    rebuilding armatures from scratch.
-
-    Per-bone behavior: head and tail positions are swapped; roll is left at its
-    current numeric value. Connected children are auto-disconnected before the
-    flip (their world position is preserved; their parent link is kept) to
-    avoid Blender force-moving them when the parent's tail changes.
-    """
+    """Swap head and tail of selected bones, preserving roll - to migrate to the
+    vanilla bone convention without rebuilding armatures. Connected children are
+    auto-disconnected first (world position kept) so they don't snap."""
 
     bl_idname = "io_pdx_mesh.flip_bone_head_tail"
     bl_label = "Flip bone (swap head/tail)"
@@ -137,9 +113,8 @@ class IOPDX_OT_flip_bone_head_tail(Operator):
         disconnected_children = 0
 
         for bone in selected:
-            # Disconnect any connected children first so Blender does not drag
-            # them along when we move the parent's tail. Children keep their
-            # world position and parent link, they just stop being 'connected'.
+            # Disconnect connected children first so Blender doesn't drag them when
+            # we move the parent's tail; they keep world position and parent link.
             for child in bone.children:
                 if child.use_connect:
                     child.use_connect = False
@@ -160,16 +135,8 @@ class IOPDX_OT_flip_bone_head_tail(Operator):
 
 
 class IOPDX_OT_align_weapon_by_two_points(Operator):
-    """Align a weapon mesh by two vertices: midpoint at object origin, back->front along +Y.
-
-    Workflow: in Edit Mode on a weapon mesh, select exactly 2 vertices. The
-    ACTIVE (last clicked, white-highlighted) vertex is treated as the muzzle
-    (front); the other as the back (stock/grip). The whole mesh is translated
-    and rotated so the midpoint between the two vertices sits at the object's
-    local origin and the back->front vector lies along +Y. The object's
-    transform is then reset to identity so the weapon ends up at world (0,0,0)
-    facing +Y.
-    """
+    """Align a weapon mesh by two selected verts: midpoint -> object origin,
+    back->front (active vert = front) along +Y, then reset the transform to identity."""
 
     bl_idname = "io_pdx_mesh.align_weapon_by_two_points"
     bl_label = "Align weapon by 2 points (midpoint->origin, front->+Y)"
@@ -255,21 +222,9 @@ class IOPDX_OT_align_weapon_by_two_points(Operator):
 
 
 class IOPDX_OT_extract_selected_to_blend(Operator, ExportHelper):
-    """Extract selected objects to a new .blend file and remove them from the current scene.
-
-    Used to split a DoW-style multi-weapon soldier mesh into separate weapon
-    files. User selects one or more objects (mesh + related empties like
-    muzzle), runs the operator, picks a save path.
-
-    Implementation: spawns a background Blender process that opens the
-    on-disk copy of the current file, deletes everything except the selected
-    objects, purges orphan datablocks, and saves as the new file. Then, in
-    the current Blender session, the operator removes the selected objects
-    from the scene so the user is left with the 'leftover' scene.
-
-    The current session is NOT auto-saved after removal - use Ctrl+S to
-    persist. The file on disk must be saved before running (no unsaved changes).
-    """
+    """Write selected objects to a new .blend and remove them from the current scene
+    (e.g. splitting a multi-weapon soldier mesh). A background Blender process builds
+    the clean file; this session is not auto-saved afterwards (Ctrl+S to persist)."""
 
     bl_idname = "io_pdx_mesh.extract_selected_to_blend"
     bl_label = "Extract selected to new .blend"

@@ -1,41 +1,23 @@
-# =============================================================================
-# PDX Particle Bench - Clausewitz/HoI4 .asset particle preview inside Blender.
-#
-# Simulates a particle `.asset` and draws it attached to a real locator, so an
-# effect can be judged against the mesh it will actually fire from.
-#
-# The simulation constants were measured against the game rather than guessed:
-# velocity -> world units 1:1, planar force = acceleration in units/s^2, friction
-# = exponential decay, size = quad size in world units, real time, and
-# `{base spread}` random ranges are SYMMETRIC +/-. The one deviation found is
-# ENGINE_EMISSION_MUL below. See CHANGELOG.md.
-#
-# Why in Blender: a mesh-less preview structurally cannot show
-#   * attachment to a real locator,
-#   * force directions in the parent BONE frame,
-#   * local_space=yes/no (indistinguishable while the emitter is static),
-# and size can only be judged as a RATIO against known geometry, which cancels
-# the entity `scale` the game applies to both mesh and particles alike.
-#
-# Rendering goes through the `gpu` module rather than EEVEE materials, because
-# that is the only way to get TRUE additive blending - the most common blend
-# mode in these effects. Viewport-only by design: a measuring instrument, not a
-# render path.
+# PDX Particle Bench - preview a HoI4 .asset particle effect on a real locator
+# inside Blender, to judge it against the mesh it fires from. Behaviour is
+# measured against the game; the change history is in CHANGELOG.md.
+# Drawing goes through the gpu module (the only way to get true additive blend).
+# Viewport-only: a measuring instrument, not a render path.
 #
 # Copyright (C) 2026 pdx-blender-tools contributors.
 # SPDX-License-Identifier: GPL-3.0-or-later
-# =============================================================================
 
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 5, 1),
+    "version": (0, 5, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > PDX Blender Tools",
     "description": "Preview Clausewitz/HoI4 .asset particle effects on a real locator",
     "category": "3D View",
 }
 
+import json
 import math
 import os
 import random
@@ -46,16 +28,66 @@ import bpy
 import gpu
 from bpy.app.handlers import persistent
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
-# --- calibrated engine constant ---------------------------------------------
-# `emission` is a literal particles/second - the engine applies NO multiplier.
-# Re-measured 2026-07-21 on the calibration ruler: a single continuous emitter with
-# emission=1, life=2 held ~2 particles in game (= rate x life x 1), so the multiplier
-# is 1. The earlier value of 3 came from a rapid-fire weapon whose ASSET spams many
-# events per second; that event-spam, not any per-subsystem multiplier, was the "3x".
-# A clean single-event test isolates the true rate.
+# `emission` is a literal particles/second - the engine applies no multiplier.
 ENGINE_EMISSION_MUL = 1.0
+
+# A HoI4 vortex is mostly a RADIAL push from its axis with a slight tangential
+# lean. This is that lean as a fraction of the radial push (0.09 = ~5 degrees),
+# read off the swarm; a single-particle trace is too insensitive to show it.
+VORTEX_SWIRL = 0.09
+
+# `spin`/orbit force: radians/sec of orbit per unit of `amount` (amount IS rad/s).
+SPIN_RATE = 1.0
+
+# Turbulence: each particle holds one push direction and swaps it for a fresh
+# random one at random intervals. TURB_RATE = direction changes per second,
+# matched against the game on the DISTRIBUTION of outcomes, not a single trace:
+# some particles run off almost straight, others mill about without clearing ring 10.
+TURB_RATE = 8.0
+
+# Intervals are spread this far around the mean (0.25x to 1.75x) - what produces
+# those two extremes: a long draw keeps accelerating one way, short draws stall.
+TURB_INTERVAL_JITTER = 0.75
+
+# Fraction of a particle's turbulence direction that is its OWN vs. the direction
+# shared by every live particle. The shared part makes newborns leave together as
+# a stream; this pulls them apart afterwards. Above ~0.15 the stream never forms.
+TURB_MIX = 0.1
+
+# constants.json overrides the defaults above so they can be tuned without editing
+# code; missing or malformed entries silently keep the default.
+_CONSTANTS = (
+    ("measured", "emission_multiplier", "ENGINE_EMISSION_MUL"),
+    ("fitted", "vortex_swirl", "VORTEX_SWIRL"),
+    ("fitted", "turbulence_rate", "TURB_RATE"),
+    ("fitted", "turbulence_interval_jitter", "TURB_INTERVAL_JITTER"),
+    ("fitted", "turbulence_per_particle", "TURB_MIX"),
+    ("fitted", "spin_rate", "SPIN_RATE"),
+)
+
+
+def load_constants():
+    """Re-read constants.json over the built-in defaults. Called on register and whenever an
+    effect is loaded or restarted, so tuning a value only needs a click, not a script reload."""
+    path = os.path.join(os.path.dirname(__file__), "constants.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        print("[pdx_bench] constants.json unreadable, keeping built-in values: %s" % exc)
+        return
+    g = globals()
+    for group, key, name in _CONSTANTS:
+        val = (data.get(group) or {}).get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            g[name] = float(val)
+        elif val is not None:
+            print("[pdx_bench] constants.json: %s.%s is not a number, ignored" % (group, key))
+
 
 FIXED_DT = 1.0 / 120.0
 MAX_STEPS_PER_UPDATE = 4000
@@ -92,11 +124,9 @@ def _convert(tok):
 
 
 class _Parser:
-    """Recursive-descent parser for the Paradox bracket format.
-
-    Repeated keys (subsystem/animation/force) collect into a list, tracked
-    separately from values that are genuinely lists (e.g. `velocity={ 20 15 }`).
-    """
+    """Recursive-descent parser for the Paradox bracket format. Repeated keys
+    (subsystem/animation/force) collect into a list, tracked separately from
+    genuine value lists like `velocity={ 20 15 }`."""
 
     def __init__(self, tokens):
         self.toks = tokens
@@ -204,7 +234,11 @@ def size_of(v):
 
 
 def alpha_of(v):
-    """`alpha=150,muzzle_fade` -> (base, curve_ref)."""
+    """`alpha=150,muzzle_fade` or `alpha={ 10,smoke_fade 10 }` -> (base, curve_ref).
+    The braced form is a `{ base spread }` range; the spread is parsed but dropped
+    (alpha is not randomised per particle anywhere)."""
+    if isinstance(v, list):
+        v = v[0] if v else 0
     if isinstance(v, str) and "," in v:
         head, ref = v.split(",", 1)
         return (_float(head), ref)
@@ -237,9 +271,50 @@ def sample_curve(pts, u):
     return float(pts[(n - 1) * 2 + 1])
 
 
-# The web Bench treated the .asset's (x, y, z) as (right, up, forward) - that
-# convention is what got validated, so positions and force directions are mapped
-# through the same basis here.
+def sample_anim(anim, u):
+    """Sample an animation and remap it into its authored range: min + curve(u)*(max-min).
+    This is the value op=MUL multiplies the field by; for a 0..1 anim it is the raw curve."""
+    lo = anim.get("min", 0.0)
+    hi = anim.get("max", 1.0)
+    return lo + sample_curve(anim["pts"], u) * (hi - lo)
+
+
+def anim_phase(anim, p, u_life):
+    """Where to sample a per-particle curve, honouring `time` and `repeat`:
+    life -> age/life; life_abs -> age/duration (absolute seconds); spawn -> frozen
+    at birth. repeat=yes wraps the phase into 0..1 instead of clamping."""
+    tm = anim["time"]
+    if tm == "spawn":
+        ph = p.spawn_frac
+    elif tm == "life_abs":
+        ph = (p.age / anim["dur"]) if anim["dur"] > 0 else u_life
+    elif tm == "system" and anim["repeat"]:
+        # system = the global clock, shared by all particles. Only meaningful with
+        # repeat=yes (a continuous loop); the sim clock stands in for the game clock.
+        # system+repeat=no is dead, so it falls through to `life`.
+        ph = (SIM.t if SIM is not None else 0.0) / anim["dur"]
+    else:  # life (and system without repeat)
+        ph = u_life
+    if anim["repeat"]:
+        return ph - math.floor(ph)
+    return 0.0 if ph < 0.0 else (1.0 if ph > 1.0 else ph)
+
+
+def apply_anim(base, anim, u):
+    """Combine an animation with a field's base, honouring `op`. The engine recognises
+    two special ops and treats everything else (the default) as ADD:
+      MUL = base * value   ABS = value replaces base   ADD/other = base + value"""
+    v = sample_anim(anim, u)
+    op = anim.get("op", "ADD")
+    if op == "MUL":
+        return base * v
+    if op == "ABS":
+        return v
+    return base + v
+
+
+# The .asset (x, y, z) is read as (right, up, forward) - the basis the web Bench
+# validated - so positions and force directions map through it.
 AXIS_PRESETS = {
     "Y_FWD_Z_UP": (Vector((0, 1, 0)), Vector((0, 0, 1)), Vector((1, 0, 0))),
     "NEG_Y_FWD_Z_UP": (Vector((0, -1, 0)), Vector((0, 0, 1)), Vector((-1, 0, 0))),
@@ -260,49 +335,132 @@ def basis(axis_key):
 
 class Subsystem:
     def __init__(self, idx, raw):
-        tex = raw.get("texture", {}) or {}
-        col = raw.get("color", {}) or {}
-        pos = raw.get("position", {}) or {}
+        # A few foreign mods write a key twice (two `texture` blocks); the parser
+        # makes that a list. Take the first so `.get` still works.
+        def _one(v):
+            return (v[0] if v else {}) if isinstance(v, list) else v
+        tex = _one(raw.get("texture", {})) or {}
+        col = _one(raw.get("color", {})) or {}
+        pos = _one(raw.get("position", {})) or {}
 
         self.idx = idx
         self.name = raw.get("name", "sub%d" % idx)
+        # childsystem: a sub-emitter. parent_idx/child_idxs are filled in by Effect.
+        # A child emits from each PARENT particle's moving position, not the locator;
+        # its start/duration are measured against the parent particle's age.
+        self.parent_idx = None
+        self.child_idxs = []
         self.max_amount = int(_float(raw.get("max_amount", 0)))
-        self.emission = _float(raw.get("emission", 0))
+        # emission can carry a curve (`emission=200,fire_emission`, unbraced). It plays
+        # over the EMITTER timeline: rate(t) = base * anim((t-start)/anim_duration).
+        self.emission, self.emission_s, self.emission_ref = size_of(raw.get("emission", 0))
         self.start = _float(raw.get("start", 0))
         self.duration = _float(raw.get("duration", 0)) if "duration" in raw else 0.0
 
         self.life_b, self.life_s = as_range(raw.get("life"))
-        self.eyaw_b, self.eyaw_s = as_range(raw.get("emitter_yaw"))
-        self.epitch_b, self.epitch_s = as_range(raw.get("emitter_pitch"))
+        # emitter_yaw/pitch can carry a spawn-time curve that sweeps the emission
+        # direction over the emitter timeline (size_of recovers base+ref).
+        self.eyaw_b, self.eyaw_s, self.eyaw_ref = size_of(raw.get("emitter_yaw"))
+        self.epitch_b, self.epitch_s, self.epitch_ref = size_of(raw.get("emitter_pitch"))
         self.vyaw_b, self.vyaw_s = as_range(raw.get("velocity_yaw"))
         self.vpitch_b, self.vpitch_s = as_range(raw.get("velocity_pitch"))
-        self.vel_b, self.vel_s = as_range(raw.get("velocity"))
-        self.rot_b, self.rot_s = as_range(raw.get("rotation"))
+        # velocity can carry a curve; parse like size for base+spread+ref. The ref is
+        # left unapplied (its one vanilla use is the dead time="system" clock).
+        self.vel_b, self.vel_s, self.vel_ref = size_of(raw.get("velocity"))
+        # `rotation` can carry a curve: drawn angle is (base+spread) * anim(t), so a
+        # base of 0 still spins via the spread. Curve and rotation_speed never coexist.
+        self.rot_b, self.rot_s, self.rot_ref = size_of(raw.get("rotation"))
         self.rotspd_b, self.rotspd_s = as_range(raw.get("rotation_speed"))
         self.size_b, self.size_s, self.size_ref = size_of(raw.get("size"))
         self.alpha_b, self.alpha_ref = alpha_of(col.get("alpha"))
-        # billboard=no quads are oriented by these instead of facing the camera
-        self.pyaw = as_range(raw.get("particle_yaw"))[0]
-        self.ppitch = as_range(raw.get("particle_pitch"))[0]
+        # billboard=no quads are oriented by particle_yaw/pitch: the base aims the whole
+        # subsystem, the spread gives each particle its own facing. particle_yaw can also
+        # carry a life-time curve that sweeps the facing (searchlights).
+        self.pyaw_b, self.pyaw_s, self.pyaw_ref = size_of(raw.get("particle_yaw"))
+        self.ppitch_b, self.ppitch_s = as_range(raw.get("particle_pitch"))
+        self.pyaw = self.pyaw_b      # base, for the per-subsystem fast path
+        self.ppitch = self.ppitch_b
+        # rotation_speed_yaw/pitch spin the 3D facing over life (deg/sec), distinct
+        # from rotation_speed which rolls the quad within its own plane.
+        self.rsyaw_b, self.rsyaw_s = as_range(raw.get("rotation_speed_yaw"))
+        self.rspitch_b, self.rspitch_s = as_range(raw.get("rotation_speed_pitch"))
+        # rotation_speed_roll is in-plane spin like rotation_speed, so it folds into the
+        # roll rate below. Always 0 in the wild, so this reading is unverified.
+        self.rsroll_b, self.rsroll_s = as_range(raw.get("rotation_speed_roll"))
 
         self.offset = (_float(pos.get("x")), _float(pos.get("y")), _float(pos.get("z")))
-        self.color = (
-            min(max(_float(col.get("x", 255)), 0), 255) / 255.0,
-            min(max(_float(col.get("y", 255)), 0), 255) / 255.0,
-            min(max(_float(col.get("z", 255)), 0), 255) / 255.0,
-        )
+        # A colour channel has the same grammar as size/alpha - `{ base[,curve] spread }` -
+        # so parse via size_of: bare `x=220`, a per-particle spread, or a life curve
+        # (fireballs decay a white flash to red this way). r/g/b alias x/y/z; a missing
+        # channel defaults to 255 (white).
+        self.chan = []
+        for xyz, rgb in (("x", "r"), ("y", "g"), ("z", "b")):
+            v = col.get(xyz, col.get(rgb, 255))
+            base, spread, ref = size_of(v)
+            self.chan.append((base / 255.0, spread / 255.0, ref))
+        self.color = tuple(min(max(c[0], 0.0), 1.0) for c in self.chan)
+        self.col_spread = any(c[1] for c in self.chan)
+        self.col_ref = any(c[2] for c in self.chan)
         self.additive = "additive" in str(tex.get("shader", "")).lower()
         self.tex_file = str(tex.get("file", "") or "")
         self.billboard = raw.get("billboard") != "no"
         self.local_space = raw.get("local_space") != "no"
+        # Go per-particle whenever an oriented quad's facing can differ between
+        # particles: it spins (rotation_speed_yaw/pitch), animates (a particle_yaw
+        # curve), or scatters from a particle_yaw/_pitch spread.
+        self.orient_per_particle = (not self.billboard) and bool(
+            self.rsyaw_b or self.rsyaw_s or self.rspitch_b or self.rspitch_s
+            or self.pyaw_ref
+            or self.pyaw_s or self.ppitch_s
+        )
         self.emitter_type = raw.get("emitter_type", "point")
+        # texture atlas / flipbook: x,y = frame grid (1,1 = single static image)
+        self.atlas = (
+            max(1, int(_float(tex.get("x", 1)))),
+            max(1, int(_float(tex.get("y", 1)))),
+        )
+        # A "sphere" emitter is spherical COORDINATES, each a `{ base spread }` range:
+        # radius, yaw around the locator, pitch off the horizontal. So pitch={ 0 0 } is
+        # a flat RING, not a ball, and { 0 40 } is a band around the equator.
+        self.sphere_r = as_range(raw.get("sphere_emitter_radius"))
+        if not self.sphere_r[0] and not self.sphere_r[1]:
+            self.sphere_r = (0.06, 0.0)          # no radius authored: a token jitter
+        self.sphere_yaw = as_range(raw.get("sphere_emitter_yaw"))
+        self.sphere_pitch = as_range(raw.get("sphere_emitter_pitch"))
+        # Pulsed emission: emit for _duration seconds, silent for _silence, repeat.
+        # The two ONLY work as a pair - one alone emits continuously.
+        self.pulse_dur = as_range(raw.get("emission_pulse_duration"))
+        self.pulse_sil = as_range(raw.get("emission_pulse_silence"))
+        self.pulsed = (
+            "emission_pulse_duration" in raw and "emission_pulse_silence" in raw
+        )
+        self.pulse_half = (
+            not self.pulsed
+            and ("emission_pulse_duration" in raw or "emission_pulse_silence" in raw)
+        )
+        # `mass` divides the acceleration a force imparts (a = F/m); it leaves an
+        # authored `velocity` alone. Guarded against 0.
+        self.mass = _float(raw.get("mass", 1.0)) or 1.0
+        # box_emitter_* are `{ base spread }` ranges, not plain widths: a bare
+        # `box_emitter_x=10` means base 10, spread 0 (every particle at x=10).
+        self.box = (
+            as_range(raw.get("box_emitter_x")),
+            as_range(raw.get("box_emitter_y")),
+            as_range(raw.get("box_emitter_z")),
+        )
         force_val = raw.get("force")
         self.forces = (
             [f.strip() for f in force_val.split(",") if f.strip()]
             if isinstance(force_val, str)
             else []
         )
-        self.enabled = True
+        # `hide=yes` suppresses the subsystem (in vanilla, an off-switch for abandoned
+        # content). Confirmed in game.
+        self.hide = raw.get("hide") == "yes"
+        # `trail=yes` draws nothing at all in this build - not even the particles - so it
+        # is treated as unsupported. Confirmed in game; used on one vanilla subsystem.
+        self.trail = raw.get("trail") == "yes"
+        self.enabled = not (self.hide or self.trail)
         self.live = 0
 
 
@@ -310,11 +468,21 @@ class Force:
     def __init__(self, raw):
         self.name = raw.get("name", "")
         self.type = raw.get("type", "planar")
-        self.amount = _float(raw.get("amount"))
+        # `amount` can carry a curve (`amount=6,drag_anim`, unbraced), but the curve is
+        # DEAD - the force always uses the base. Parsed only to recover that base.
+        self.amount, self.amount_s, self.amount_ref = size_of(raw.get("amount"))
         d = raw.get("direction", [0, 1, 0])
         if not isinstance(d, list) or len(d) < 3:
             d = [0, 1, 0]
         self.dir_raw = (_float(d[0]), _float(d[1]), _float(d[2]))
+        pv = raw.get("position", [0, 0, 0])
+        if not isinstance(pv, list) or len(pv) < 3:
+            pv = [0, 0, 0]
+        self.pos_raw = (_float(pv[0]), _float(pv[1]), _float(pv[2]))
+        # Stable per-force offset so two turbulence fields never drift in lockstep;
+        # derived from the name to stay reproducible across reloads. (`division` is
+        # inert, so it is not read.)
+        self.hash_off = float(sum(ord(c) for c in self.name) % 97)
         self.local = raw.get("local_force") != "no"
 
 
@@ -322,18 +490,47 @@ class Effect:
     def __init__(self, text):
         root = _Parser(tokenize(text)).parse()
         particle = root.get("particle")
+        if isinstance(particle, list):
+            # a few foreign mods pack several particle={} blocks per file; preview the first.
+            particle = particle[0] if particle else None
         if not particle:
             raise ValueError("no particle={...} block found")
         self.name = particle.get("name", "(unnamed)")
-        self.subs = [Subsystem(i, s) for i, s in enumerate(many(particle, "subsystem"))]
+        # Flatten the subsystem tree (top-level + nested childsystems) into one indexed
+        # list, each remembering its parent. Children emit from parent particles, not the
+        # locator (see Instance.step).
+        self.subs = []
+
+        def _add_sub(raw, parent_idx):
+            idx = len(self.subs)
+            sub = Subsystem(idx, raw)
+            sub.parent_idx = parent_idx
+            self.subs.append(sub)
+            for craw in many(raw, "childsystem"):
+                _add_sub(craw, idx)
+
+        for sraw in many(particle, "subsystem"):
+            _add_sub(sraw, None)
+        for sub in self.subs:
+            if sub.parent_idx is not None:
+                self.subs[sub.parent_idx].child_idxs.append(sub.idx)
         if not self.subs:
             raise ValueError("particle block has no subsystem={...}")
         self.anims = {}
         for a in many(particle, "animation"):
             curve = a.get("curve")
+            # minValue/maxValue remap the normalised 0..1 curve: value = min + curve*(max-min),
+            # then op combines it with the field. Most anims are 0..1 (remap is identity).
             self.anims[a.get("name", "")] = {
                 "pts": curve if isinstance(curve, list) else [],
-                "time": "spawn" if a.get("time") == "spawn" else "life",
+                "time": a.get("time", "life"),  # life / life_abs / spawn / system
+                "min": _float(a.get("minValue", 0.0)),
+                "max": _float(a.get("maxValue", 1.0)) if "maxValue" in a else 1.0,
+                "op": a.get("op", "MUL"),  # MUL (vanilla), ADD, or ABS
+                # seconds the curve spans: 1 for life anims, real seconds for emission
+                # anims (which play over the emitter timeline, not a particle's).
+                "dur": _float(a.get("duration", 1.0)) or 1.0,
+                "repeat": a.get("repeat") == "yes",
             }
         self.forces = {}
         for f in many(particle, "force"):
@@ -352,6 +549,13 @@ class Effect:
         for s in self.subs:
             if s.duration == 0:
                 out.append("%s: duration=0 spawns ZERO particles" % s.name)
+            if s.pulse_half:
+                # 9 of vanilla's 13 pulse users set only one half and so pulse nothing -
+                # easy to copy from a vanilla file and believe.
+                out.append(
+                    "%s: emission_pulse_duration and _silence only work as a PAIR - one alone "
+                    "does nothing, emission stays continuous" % s.name
+                )
         spaces = {s.local_space for s in self.subs}
         alpha_subs = [s.name for s in self.subs if not s.additive]
         if len(spaces) > 1 and alpha_subs:
@@ -359,6 +563,18 @@ class Effect:
                 "mixed local_space + alpha-blend (%s): HoI4 may silently drop them"
                 % ", ".join(alpha_subs)
             )
+        # `vortex` is only modelled for an UPRIGHT axis; a tilted axis sends particles up
+        # at an angle no simple force law reproduces. Rare (3 subsystems, the only
+        # non-zero one upright), so it is flagged rather than chased.
+        for f in self.forces.values():
+            if f.type != "vortex":
+                continue
+            tilted = abs(f.dir_raw[0]) > 1e-6 or abs(f.dir_raw[2]) > 1e-6
+            if tilted and f.amount:
+                out.append(
+                    "%s: vortex with a TILTED axis is not modelled correctly - the preview "
+                    "will be wrong (upright axes are fine)" % f.name
+                )
         return out
 
 
@@ -369,7 +585,9 @@ class Effect:
 
 class Particle:
     __slots__ = ("si", "pos", "vel", "age", "life", "rot", "rotspd",
-                 "size0", "spawn_frac", "local", "mat")
+                 "size0", "spawn_frac", "local", "seed", "col",
+                 "oyaw", "opitch", "osyaw", "ospitch",
+                 "turb_dir", "turb_next", "turb_n", "mat", "child_budget")
 
     def __init__(self):
         self.si = 0
@@ -382,7 +600,17 @@ class Particle:
         self.size0 = 1.0
         self.spawn_frac = 0.0
         self.local = True
+        self.seed = 0.0  # per-particle noise seed (turbulence force)
+        self.col = None  # per-particle colour, only when a channel has a spread
+        self.oyaw = 0.0    # oriented-quad facing at spawn (deg), only when orient_per_particle
+        self.opitch = 0.0
+        self.osyaw = 0.0   # facing spin rate (deg/sec): rotation_speed_yaw / _pitch
+        self.ospitch = 0.0
+        self.turb_dir = Vector((0.0, 0.0, 0.0))  # current turbulence push direction
+        self.turb_next = 0.0                     # age at which it is re-rolled
+        self.turb_n = 0                          # how many times it has been re-rolled
         self.mat = None  # emitter matrix captured at spawn (world-space particles)
+        self.child_budget = None  # per-child emission accumulator, only on parent particles
 
 
 class Instance:
@@ -392,6 +620,8 @@ class Instance:
         self.effect = effect
         self.start = start
         self.parts = []
+        # Pulse timings, rolled once per fired effect and then fixed - see step().
+        self.pulse = [None] * len(effect.subs)
         self.budget = [0.0] * len(effect.subs)
         self.count = [0] * len(effect.subs)
         self.done = False
@@ -404,8 +634,10 @@ class Instance:
         fwd, up, right = basis(cfg["axis"])
         rot3 = emitter_mat.to_3x3() if emitter_mat else None
 
-        # --- emission ---
+        # --- emission (locator subsystems only; children emit from parents, see below) ---
         for si, s in enumerate(eff.subs):
+            if s.parent_idx is not None:
+                continue
             if not s.enabled or s.duration == 0:
                 continue
             in_window = t_local >= s.start and (
@@ -413,7 +645,27 @@ class Instance:
             )
             if not in_window:
                 continue
-            self.budget[si] += s.emission * ENGINE_EMISSION_MUL * cfg["emission"] * dt
+            if s.pulsed:
+                if self.pulse[si] is None:
+                    # _silence is a range, drawn ONCE per effect (not per cycle): a range
+                    # varies the gap between firings, not the rhythm within one.
+                    self.pulse[si] = (
+                        max(0.0, s.pulse_dur[0] + _spread(s.pulse_dur[1], cfg["spread"], rng)),
+                        max(0.0, s.pulse_sil[0] + _spread(s.pulse_sil[1], cfg["spread"], rng)),
+                    )
+                pdur, psil = self.pulse[si]
+                cycle = pdur + psil
+                if cycle > 0 and (t_local - s.start) % cycle >= pdur:
+                    continue  # silent half: nothing emitted and no budget carried over
+            rate = s.emission
+            if s.emission_ref:
+                anim = eff.anims.get(s.emission_ref)
+                if anim:
+                    # curve plays over the emitter timeline, sampled at the elapsed
+                    # fraction (not frozen per particle). min/max still remap.
+                    phase = (t_local - s.start) / anim["dur"]
+                    rate = apply_anim(s.emission, anim, min(max(phase, 0.0), 1.0))
+            self.budget[si] += rate * ENGINE_EMISSION_MUL * cfg["emission"] * dt
             while self.budget[si] >= 1.0:
                 self.budget[si] -= 1.0
                 if self.count[si] >= s.max_amount:
@@ -421,6 +673,8 @@ class Instance:
                 self._spawn(si, s, t_local, cfg, rng, emitter_mat, fwd, up, right)
 
         # --- integrate ---
+        # A force `amount` CURVE is dead (all 7 vanilla uses are the inert time="system"
+        # clock), so the force always uses the plain base.
         for p in self.parts:
             if p.age >= p.life:
                 continue
@@ -434,55 +688,144 @@ class Instance:
                 if not f:
                     continue
                 if f.type == "friction":
-                    k = math.exp(-f.amount * cfg["friction"] * dt)
-                    p.vel *= k
-                else:
-                    # Force direction uses a DIFFERENT mapping than position:
-                    # .asset (x, y, z) -> the locator's local (X, Z, Y), i.e. the same
-                    # Y<->Z swap as io_pdx_mesh's SPACE_MATRIX. Confirmed against two
-                    # independently recorded in-game findings on one vehicle: at its
-                    # turret-mounted flamer the locator's local X points world-down and
-                    # DOWN is {1,0,0}, while at a hull-mounted one local Y points
-                    # world-down and DOWN is {0,0,1}. Position keeps (forward, up,
-                    # right) - that one was confirmed visually by a muzzle flash sitting
-                    # off to the side. The asymmetry is suspicious and deserves a probe.
-                    d = right * f.dir_raw[0] + up * f.dir_raw[1] + fwd * f.dir_raw[2]
-                    # ALWAYS the locator's local frame: local_force=no does NOT mean
-                    # world space - the bone's rest rotation still applies either way.
-                    # Only convert when the PARTICLE itself lives in world space.
+                    # friction is a real force, divided by mass like the rest, so the
+                    # decay rate is amount/mass.
+                    p.vel *= math.exp(-f.amount * cfg["friction"] * dt / s.mass)
+                elif f.type == "spin":
+                    # `type="spin"` orbit force: rotate the position about the axis at a
+                    # constant angular rate (radius preserved). amount = rad/s, CCW about
+                    # +axis. No vanilla file uses it.
+                    center = right * f.pos_raw[0] + up * f.pos_raw[1] + fwd * f.pos_raw[2]
+                    axis = right * f.dir_raw[0] + up * f.dir_raw[1] + fwd * f.dir_raw[2]
                     if rot3 is not None and not p.local:
-                        d = rot3 @ d
-                    p.vel += d * (f.amount * cfg["force"] * dt)
+                        # world-space particle: axis is world, centre stays at the emitter.
+                        center = emitter_mat @ center
+                    ax = axis.normalized() if axis.length > 1e-9 else up
+                    ang = f.amount * SPIN_RATE * cfg["force"] * dt
+                    rel = Matrix.Rotation(ang, 4, ax) @ (p.pos - center)
+                    p.pos = center + rel
+                elif f.type in ("point", "vortex"):
+                    # point/vortex: `amount` is acceleration in u/s^2, like planar.
+                    # `position` uses the FORCE axes (x=right, y=up, z=fwd). For a
+                    # local_space=no particle the axis is WORLD but the centre stays
+                    # emitter-relative (the particle still spawns at the emitter).
+                    center = right * f.pos_raw[0] + up * f.pos_raw[1] + fwd * f.pos_raw[2]
+                    axis = right * f.dir_raw[0] + up * f.dir_raw[1] + fwd * f.dir_raw[2]
+                    if rot3 is not None and not p.local:
+                        center = emitter_mat @ center
+                    to_p = p.pos - center
+                    if f.type == "point":
+                        # negative `amount` pulls TOWARD the point, positive pushes away.
+                        d = to_p.normalized() if to_p.length > 1e-9 else Vector((0.0, 0.0, 0.0))
+                    else:
+                        # mostly a radial push (magnitude `amount`) plus a slight swirl.
+                        ax = axis.normalized() if axis.length > 1e-9 else up
+                        radial = to_p - ax * to_p.dot(ax)
+                        if radial.length > 1e-9:
+                            d = radial.normalized() + ax.cross(radial).normalized() * VORTEX_SWIRL
+                        else:
+                            d = Vector((0.0, 0.0, 0.0))
+                    if d.length > 1e-9:
+                        p.vel += d * (f.amount * cfg["force"] * dt / s.mass)
+                elif f.type == "turbulence":
+                    # Turbulence in two parts: a SHARED direction every live particle gets
+                    # (makes newborns, all on the emitter, leave together as a stream) and a
+                    # PER-PARTICLE one re-rolled at random intervals (pulls them apart). All
+                    # derived from p.seed / the force hash, so scrubbing replays identically.
+                    if p.age >= p.turb_next:
+                        p.turb_n += 1
+                        p.turb_dir = _rand_dir(p.seed * 7.13 + p.turb_n * 13.7 + f.hash_off)
+                        mean = 1.0 / TURB_RATE
+                        jitter = 1.0 + TURB_INTERVAL_JITTER * (
+                            _hash01(p.seed * 3.3 + p.turb_n * 5.1) * 2.0 - 1.0
+                        )
+                        p.turb_next = p.age + mean * jitter
+                    shared = _rand_dir(
+                        math.floor(t_global * TURB_RATE) * 2.7 + f.hash_off + 0.5
+                    )
+                    d = shared * (1.0 - TURB_MIX) + p.turb_dir * TURB_MIX
+                    if d.length > 1e-9:
+                        p.vel += d.normalized() * (f.amount * cfg["force"] * dt / s.mass)
+                else:
+                    # planar. direction maps .asset (x, y, z) -> locator local (X, Z, Y),
+                    # the same Y<->Z swap as io_pdx_mesh's SPACE_MATRIX. For a
+                    # local_space=no particle the direction is WORLD-referenced (the
+                    # locator rotation is NOT applied); local_space=yes rides the emitter
+                    # via the draw transform.
+                    d = right * f.dir_raw[0] + up * f.dir_raw[1] + fwd * f.dir_raw[2]
+                    p.vel += d * (f.amount * cfg["force"] * dt / s.mass)
             p.pos += p.vel * (cfg["world"] * dt)
             p.rot += p.rotspd * dt
+
+        # --- childsystem emission: each parent particle emits its children from its own
+        # moving position, so the burst rides the parent. Child start/duration are vs. the
+        # parent's age; children live independently once spawned. Snapshot the parents
+        # first - _spawn appends the new children to self.parts.
+        for p in list(self.parts):
+            if p.age >= p.life:
+                continue
+            ps = eff.subs[p.si]
+            if not ps.child_idxs:
+                continue
+            if p.child_budget is None:
+                p.child_budget = {}
+            for ci in ps.child_idxs:
+                cs = eff.subs[ci]
+                if not cs.enabled or cs.duration == 0:
+                    continue
+                in_win = p.age >= cs.start and (
+                    cs.duration < 0 or p.age < cs.start + cs.duration
+                )
+                if not in_win:
+                    continue
+                b = p.child_budget.get(ci, 0.0) + (
+                    cs.emission * ENGINE_EMISSION_MUL * cfg["emission"] * dt
+                )
+                while b >= 1.0:
+                    b -= 1.0
+                    if self.count[ci] >= cs.max_amount:
+                        break
+                    self._spawn(ci, cs, t_local, cfg, rng, emitter_mat,
+                                fwd, up, right, base_pos=p.pos)
+                p.child_budget[ci] = b
 
         self.parts = [p for p in self.parts if p.age < p.life]
         if t_local > eff.window() and sum(self.count) <= 0:
             self.done = True
 
-    def _spawn(self, si, s, t_local, cfg, rng, emitter_mat, fwd, up, right):
+    def _spawn(self, si, s, t_local, cfg, rng, emitter_mat, fwd, up, right, base_pos=None):
         mode = cfg["spread"]
-        yaw = math.radians(
-            s.eyaw_b + _spread(s.eyaw_s, mode, rng) + _spread(s.vyaw_s, mode, rng)
+        # position along the emitter timeline, 0..1 - drives every spawn-time curve.
+        sfrac = (
+            min(max((t_local - s.start) / s.duration, 0.0), 1.0) if s.duration > 0 else 0.0
         )
-        # io_pdx_mesh's SPACE_MATRIX is a Y/Z swap with determinant -1 - a MIRROR, not
-        # a rotation - so yaw handedness arrives inverted and must be negated back.
-        # Measured on a mirrored pair of engine-exhaust effects: the left-hand file
-        # (emitter_yaw=+90) blew to world right and the right-hand one (-90) to world
-        # left, both mirrored the same way. Effects whose yaw base is 0 - muzzle
-        # flashes, flame streams - are unaffected either way.
+
+        def _emit_base(base, ref):
+            # A spawn-time curve sweeps the emission DIRECTION over the emitter timeline.
+            if ref:
+                anim = self.effect.anims.get(ref)
+                if anim and anim["time"] == "spawn":
+                    return apply_anim(base, anim, sfrac)
+            return base
+
+        # emitter_yaw/pitch aims the emitter; velocity_yaw/pitch adds to it. Both bases
+        # count (plus their spreads) - a base velocity_pitch is what stands rising smoke up.
+        yaw = math.radians(
+            _emit_base(s.eyaw_b, s.eyaw_ref) + s.vyaw_b
+            + _spread(s.eyaw_s, mode, rng) + _spread(s.vyaw_s, mode, rng)
+        )
+        # io_pdx_mesh's SPACE_MATRIX is a mirror (Y/Z swap, det -1), so yaw handedness
+        # arrives inverted and is negated back. Effects with yaw base 0 are unaffected.
         if not cfg["flip_yaw"]:
             yaw = -yaw
         pitch = math.radians(
-            s.epitch_b + _spread(s.epitch_s, mode, rng) + _spread(s.vpitch_s, mode, rng)
+            _emit_base(s.epitch_b, s.epitch_ref) + s.vpitch_b
+            + _spread(s.epitch_s, mode, rng) + _spread(s.vpitch_s, mode, rng)
         )
         speed = s.vel_b + _spread(s.vel_s, mode, rng)
 
-        # HoI4 fires emitter_yaw=0 along the locator's local -Y - i.e. -fwd in axis-preset
-        # terms, NOT +Y. Verified in game 2026-07-21: an emitter_yaw=0 stream on a muzzle
-        # node whose 180deg-Z rotation had been REMOVED still fired backward, so -fwd is the
-        # engine's convention, not a side effect of the mod's rotated-node pipeline. Position
-        # and orientation ride the mesh's real matrix_world and need no such flip.
+        # HoI4 fires emitter_yaw=0 along the locator's local -Y (-fwd), NOT +Y - a fixed
+        # engine convention. Position/orientation ride the mesh matrix and need no flip.
         muzzle = -fwd
         direction = (
             muzzle * (math.cos(pitch) * math.cos(yaw))
@@ -490,40 +833,89 @@ class Instance:
             + up * math.sin(pitch)
         )
 
-        # .asset position axes: x = forward, y = up, z = right.
-        # y=up was validated in the web Bench (upforce lifting smoke); x-vs-z was
-        # NOT distinguishable there - with no mesh, a sideways offset looks like a
-        # forward one. Pinned down in Blender: the muzzle flash sat off to the side.
+        # .asset position axes: x = forward, y = up, z = right (pinned down in Blender).
         pos = fwd * s.offset[0] + up * s.offset[1] + right * s.offset[2]
         if s.emitter_type == "sphere":
-            pos = pos + Vector((rng.uniform(-0.06, 0.06),
-                                rng.uniform(-0.06, 0.06),
-                                rng.uniform(-0.06, 0.06)))
+            # spherical coordinates (see sphere_r). yaw=0 sits along -fwd (the muzzle
+            # axis), the same convention as emitter_yaw, NOT +fwd.
+            sr = s.sphere_r[0] + _spread(s.sphere_r[1], mode, rng)
+            sy = math.radians(s.sphere_yaw[0] + _spread(s.sphere_yaw[1], mode, rng))
+            sp = math.radians(s.sphere_pitch[0] + _spread(s.sphere_pitch[1], mode, rng))
+            cp = math.cos(sp)
+            pos = pos + (
+                -fwd * (cp * math.cos(sy)) + right * (cp * math.sin(sy)) + up * math.sin(sp)
+            ) * sr
+        elif s.emitter_type == "box":
+            pos = pos + (
+                fwd * (s.box[0][0] + _spread(s.box[0][1], mode, rng))
+                + up * (s.box[1][0] + _spread(s.box[1][1], mode, rng))
+                + right * (s.box[2][0] + _spread(s.box[2][1], mode, rng))
+            )
 
         p = Particle()
         p.si = si
         p.life = max(0.01, s.life_b + _spread(s.life_s, mode, rng))
         p.size0 = max(0.0, s.size_b + _spread(s.size_s, mode, rng))
         p.rot = s.rot_b + _spread(s.rot_s, mode, rng)
-        p.rotspd = s.rotspd_b + _spread(s.rotspd_s, mode, rng)
-        p.spawn_frac = (
-            min(max((t_local - s.start) / s.duration, 0.0), 1.0) if s.duration > 0 else 0.0
-        )
+        p.rotspd = (s.rotspd_b + s.rsroll_b) + _spread(s.rotspd_s, mode, rng)
+        if s.orient_per_particle:
+            # Facing and spin are both rolled once here; the draw advances the facing by
+            # spin * age each frame, the same way p.rot advances by p.rotspd.
+            p.oyaw = s.pyaw_b + _spread(s.pyaw_s, mode, rng)
+            p.opitch = s.ppitch_b + _spread(s.ppitch_s, mode, rng)
+            p.osyaw = s.rsyaw_b + _spread(s.rsyaw_s, mode, rng)
+            p.ospitch = s.rspitch_b + _spread(s.rspitch_s, mode, rng)
+        p.spawn_frac = sfrac
+        if s.vel_ref:
+            # animating velocity requires time="spawn" (frozen per particle at spawn_frac);
+            # a time="system" velocity curve is dead. So only spawn is honoured.
+            anim = self.effect.anims.get(s.vel_ref)
+            if anim and anim["time"] == "spawn":
+                speed = apply_anim(speed, anim, p.spawn_frac)
         p.local = s.local_space
+        p.seed = rng.uniform(0.0, 1000.0)
+        if s.col_spread:
+            # rolled once at spawn like life/size: a channel spread tints each particle.
+            p.col = tuple(
+                min(max(c[0] + _spread(c[1], mode, rng), 0.0), 1.0) for c in s.chan
+            )
 
-        if s.local_space or emitter_mat is None:
-            # Simulated in the emitter's local frame; it rides the locator.
+        if base_pos is not None:
+            # childsystem spawn: origin is the parent particle's position, not the locator;
+            # offset/velocity are placed relative to it, rotated into world by the emitter.
+            r3 = emitter_mat.to_3x3() if emitter_mat is not None else None
+            off = (r3 @ pos) if r3 is not None else pos
+            vel = (r3 @ (direction * speed)) if r3 is not None else direction * speed
+            p.pos = base_pos + off
+            p.vel = vel
+            p.mat = None
+        elif s.local_space or emitter_mat is None:
+            # local frame - rides the locator.
             p.pos = pos
             p.vel = direction * speed
             p.mat = None
         else:
-            # local_space=no: baked into world at spawn, does NOT follow the locator.
+            # local_space=no: baked into world at spawn, does not follow the locator.
             p.pos = emitter_mat @ pos
             p.vel = emitter_mat.to_3x3() @ (direction * speed)
             p.mat = None
 
         self.parts.append(p)
         self.count[si] += 1
+
+
+def _hash01(x):
+    """Deterministic pseudo-random in [0,1), stable across reloads."""
+    v = math.sin(x * 12.9898) * 43758.5453
+    return v - math.floor(v)
+
+
+def _rand_dir(seed):
+    """Evenly distributed unit vector from a seed (z uniform, then a ring around it)."""
+    a = _hash01(seed) * 2.0 * math.pi
+    z = _hash01(seed + 7.77) * 2.0 - 1.0
+    r = math.sqrt(max(0.0, 1.0 - z * z))
+    return Vector((math.cos(a) * r, math.sin(a) * r, z))
 
 
 def _spread(amp, mode, rng):
@@ -542,9 +934,8 @@ class Sim:
         self.rng = random.Random(self.seed)
         self._next_fire = 0.0
         self._fired_single = False
-        # Subsystem indices hidden from the viewport. Muting is DRAW-time only:
-        # the sim still steps them, so toggling is instant and cannot disturb the
-        # deterministic particle stream the remaining subsystems share.
+        # Subsystems hidden from the viewport. Draw-time only: the sim still steps
+        # them, so toggling is instant and cannot disturb the shared particle stream.
         self.muted = set()
 
     def configure(self, cfg):
@@ -599,10 +990,8 @@ SIM = Sim()
 
 
 # =============================================================================
-# Texture resolution - .asset paths are game-relative ("gfx/particles/glow.dds"),
-# so they are looked up in the mod root first, then vanilla, exactly like HoI4
-# resolves them. Most particle textures live in VANILLA, not the mod.
-# Blender reads .dds natively, so no conversion step is needed.
+# Texture resolution - .asset paths are game-relative, looked up in the mod root
+# first then vanilla (like HoI4; most textures live in vanilla). .dds reads natively.
 # =============================================================================
 
 _tex_cache = {}
@@ -641,9 +1030,7 @@ def get_texture(rel):
     if path:
         try:
             img = bpy.data.images.load(path, check_existing=True)
-            # Raw texel values (no sRGB transform), matching how the calibrated
-            # web Bench treated these textures.
-            img.colorspace_settings.name = "Non-Color"
+            img.colorspace_settings.name = "Non-Color"  # raw texels, no sRGB transform
             tex = gpu.texture.from_image(img)
         except Exception as exc:  # noqa: BLE001
             if rel not in _missing_reported:
@@ -685,8 +1072,7 @@ in vec4 v_col;
 out vec4 fragColor;
 void main()
 {
-    /* Procedural radial falloff stands in for the .dds. Size of the quad is what
-       matters for measuring against the mesh; real textures come later. */
+    /* Procedural radial falloff stands in for the .dds; quad SIZE is what matters. */
     vec2 d = v_uv * 2.0 - 1.0;
     float r = length(d);
     float a = clamp(1.0 - r, 0.0, 1.0);
@@ -703,11 +1089,8 @@ out vec4 fragColor;
 void main()
 {
     vec4 t = texture(image, v_uv);
-    /* The engine MULTIPLIES the subsystem's `color=` by the texture rather than
-       replacing it, so a tinted texture shifts the result: a yellow beam texture
-       under a cyan color= comes out green, because yellow carries no blue.
-       Shape comes from the alpha channel, which is where every texture checked so
-       far keeps it. */
+    /* The engine MULTIPLIES color= by the texture (a tinted texture shifts the
+       result); shape comes from the alpha channel. */
     fragColor = vec4(v_col.rgb * t.rgb, v_col.a * t.a);
 }
 """
@@ -730,8 +1113,7 @@ def get_shader(textured):
 
 VERT_BG = """
 in vec2 pos;
-/* z just inside the far plane (not exactly 1.0, which some drivers clip), so the quad
-   sits behind the mesh but still passes LESS_EQUAL against the cleared far depth. */
+/* z just inside the far plane (some drivers clip exactly 1.0), behind the mesh. */
 void main() { gl_Position = vec4(pos, 0.9999, 1.0); }
 """
 
@@ -752,16 +1134,9 @@ def get_bg_shader():
 
 
 def _draw_background(lum):
-    """Fill only the EMPTY background (not the emitter mesh) with a flat grey, so
-    ADDITIVE effects can be judged against a bright in-game scene rather than the dark
-    default viewport.
-
-    Drawn at the far plane with LESS_EQUAL depth and no depth write, so it passes only
-    where the scene left the cleared far depth - the mesh stays visible. A LINEAR stand
-    in for the game's bright, tonemapped terrain: enough to show that a dim additive
-    layer which dominates on black nearly vanishes on grey. It is not the engine's exact
-    tonemap curve.
-    """
+    """Fill the empty background (not the mesh) with flat grey, so ADDITIVE effects can
+    be judged against a bright scene instead of black. Far plane, LESS_EQUAL, no depth
+    write, so the mesh stays visible. A linear stand-in, not the engine's tonemap."""
     shader = get_bg_shader()
     batch = batch_for_shader(shader, "TRI_FAN", {"pos": [(-1, -1), (1, -1), (1, 1), (-1, 1)]})
     gpu.state.blend_set("NONE")
@@ -779,58 +1154,61 @@ def _visual(p, s, effect):
     if s.size_ref:
         anim = effect.anims.get(s.size_ref)
         if anim:
-            size *= sample_curve(
-                anim["pts"], p.spawn_frac if anim["time"] == "spawn" else u
-            )
-    alpha = s.alpha_b / 255.0
+            size = apply_anim(size, anim, anim_phase(anim, p, u))
+    # alpha and colour combine in 0..255 space (so ADD/ABS read in native units), then
+    # normalise.
+    alpha = s.alpha_b
     if s.alpha_ref:
         anim = effect.anims.get(s.alpha_ref)
         if anim:
-            alpha *= sample_curve(anim["pts"], u)
-    return size, min(max(alpha, 0.0), 1.0)
+            alpha = apply_anim(alpha, anim, anim_phase(anim, p, u))
+    alpha /= 255.0
+    col = p.col or s.color
+    if s.col_ref:
+        out = []
+        for i, (base, _spr, ref) in enumerate(s.chan):
+            c = col[i] * 255.0
+            if ref:
+                anim = effect.anims.get(ref)
+                if anim:
+                    c = apply_anim(c, anim, anim_phase(anim, p, u))
+            out.append(min(max(c / 255.0, 0.0), 1.0))
+        col = tuple(out)
+    rot = p.rot
+    if s.rot_ref:
+        # angle animated over life: (base+spread, baked into p.rot at spawn) * anim(t).
+        # A subsystem with a curve carries no rotation_speed, so p.rot has not accumulated.
+        anim = effect.anims.get(s.rot_ref)
+        if anim:
+            rot = apply_anim(p.rot, anim, anim_phase(anim, p, u))
+    return size, min(max(alpha, 0.0), 1.0), col, rot
 
 
 def oriented_quad_axes(s, axis_key, flip_yaw, flip_plume, rot3):
-    """In-plane axes for a `billboard=no` quad - locked to the emitter, not the camera.
+    """In-plane axes for a `billboard=no` quad, locked to the emitter not the camera.
+    The quad is placed by a real rotation: yaw about up, then pitch about the yawed
+    side axis. The plane normal is the rotated forward axis, so `particle_yaw` steers
+    the streak inside the plane as well as the plane itself.
+      pitch=90 -> quad lies flat    pitch=0 -> quad stands up
+      yaw=pitch=0 -> faces down the barrel"""
+    return _oriented_axes(s.pyaw, s.ppitch, axis_key, flip_yaw, flip_plume, rot3)
 
-    The quad is placed by a REAL rotation: yaw about the emitter's up axis, then
-    pitch about the yawed side axis. The plane normal is the rotated forward axis
-    and the in-plane axes are the other two rotated axes, so `particle_yaw` steers
-    the streak inside the plane as well as steering the plane itself.
 
-      pitch=90 -> normal is up      -> quad lies flat  (flash_secondary_h)
-      pitch=0  -> normal is side    -> quad stands up  (flash_secondary_v)
-      yaw=pitch=0 -> normal is fwd  -> muzzle_ring faces down the barrel
-
-    A previous model derived only the normal from yaw/pitch and then guessed the
-    in-plane axis as "the side axis, or the muzzle axis when side is degenerate".
-    It agreed with every measurement taken on beams and was still wrong, because
-    at pitch=90 the normal formula contains cos(pitch)=0 and yaw drops out of it
-    entirely - so `particle_yaw=-90` on a flat quad became a token the preview
-    ignored. Daniil caught it on the Chimera hull bolter, whose flat plume runs
-    ALONG the barrel in game at rotation=0, while that model insisted on across.
-
-    Under a real rotation the yaw survives: at pitch=90 the in-plane U axis is
-    -fwd*sin(yaw) + right*cos(yaw), which is the side axis at yaw=0 (hence the
-    multilaser cross genuinely needing rotation=90) and the muzzle axis at
-    yaw=-90 (hence the bolter being correct at rotation=0). Both measurements,
-    one rule, no special case.
-    """
+def _oriented_axes(pyaw_deg, ppitch_deg, axis_key, flip_yaw, flip_plume, rot3):
+    """Body of oriented_quad_axes with an explicit facing, so it can be called per
+    particle (scatter / rotation_speed_yaw/pitch) or per subsystem (fixed facing)."""
     fwd, up, right = basis(axis_key)
-    yaw = math.radians(s.pyaw if flip_yaw else -s.pyaw)
-    pitch = math.radians(s.ppitch)
+    yaw = math.radians(pyaw_deg if flip_yaw else -pyaw_deg)
+    pitch = math.radians(ppitch_deg)
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
 
-    # The plane normal is yawed_fwd*cp + up*sp; U and V below span that plane, so
-    # it is recoverable as U x V and is not built separately.
+    # normal is yawed_fwd*cp + up*sp, recovered as U x V rather than built separately.
     yawed_fwd = fwd * cy + right * sy
     u = -fwd * sy + right * cy          # yawed side axis - also the pitch axis
     v = -yawed_fwd * sp + up * cp
 
-    # The plume texture is asymmetric (bright at the muzzle end), so which way U
-    # points is visible. The sign of particle_yaw already decides it; this only
-    # exists to test the opposite convention without editing the .asset.
+    # the plume texture is asymmetric, so U's direction is visible; a test knob.
     if flip_plume:
         u = -u
         v = -v
@@ -874,11 +1252,29 @@ def draw_callback():
             s = effect.subs[p.si]
             if not s.enabled:
                 continue
-            size, alpha = _visual(p, s, effect)
+            size, alpha, pcol, prot = _visual(p, s, effect)
             if alpha <= 0.003 or size <= 0.0:
                 continue
             world_pos = (emitter_mat @ p.pos) if (p.local and emitter_mat) else p.pos
-            buckets.setdefault(p.si, []).append((world_pos, size, alpha, p.rot))
+            u_life = min(p.age / p.life, 1.0) if p.life > 0 else 0.0
+            oaxes = None
+            if s.orient_per_particle:
+                # this particle faces its own way (and may spin), so build its quad axes
+                # from its current facing, not the shared per-subsystem pair.
+                rot_for_orient = emitter_rot if s.local_space else None
+                yaw_now = p.oyaw
+                if s.pyaw_ref:
+                    # particle_yaw curve sweeps the facing over life (searchlights).
+                    anim = effect.anims.get(s.pyaw_ref)
+                    if anim:
+                        yaw_now = apply_anim(p.oyaw, anim, anim_phase(anim, p, u_life))
+                oaxes = _oriented_axes(
+                    yaw_now + p.osyaw * p.age, p.opitch + p.ospitch * p.age,
+                    props.axis_preset, False, False, rot_for_orient,
+                )
+            buckets.setdefault(p.si, []).append(
+                (world_pos, size, alpha, prot, u_life, oaxes)
+            )
 
     if not buckets:
         return
@@ -895,14 +1291,9 @@ def draw_callback():
             eye = Vector(region_3d.view_matrix.inverted().translation)
             items.sort(key=lambda it: -(it[0] - eye).length_squared)
 
-        # billboard=yes faces the camera. billboard=no is oriented by the emitter,
-        # but ONLY when local_space=yes. A local_space=no particle is world-referenced:
-        # the engine orients its quad by WORLD axes and ignores the locator's rotation
-        # (the locator still sets the spawn POSITION, just not the facing). Measured on
-        # the Basilisk ground shockwave - big_boom is baked 180deg-rotated, yet a
-        # pitch=90 ring lies FLAT in game and pitch=0 stands, via a temporal pitch
-        # sweep. That is only possible if the locator rotation is dropped here; applying
-        # it (as this code used to, unconditionally) inverted the plane.
+        # billboard=yes faces the camera. billboard=no is oriented by the emitter, but
+        # ONLY when local_space=yes; a local_space=no quad is oriented by WORLD axes (the
+        # locator sets position, not facing).
         if s.billboard:
             ax_u, ax_v = cam_right, cam_up
         else:
@@ -911,15 +1302,27 @@ def draw_callback():
                 s, props.axis_preset, False, False, rot_for_orient
             )
 
+        nx, ny = s.atlas
+        nframes = nx * ny
         coords, uvs, cols, indices = [], [], [], []
-        for n, (wp, size, alpha, rot) in enumerate(items):
+        for n, (wp, size, alpha, rot, u_life, oaxes) in enumerate(items):
             half = size * size_gain * 0.5
+            au, av = oaxes if oaxes is not None else (ax_u, ax_v)
             ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
-            rx = (ax_u * ca + ax_v * sa) * half
-            ry = (ax_v * ca - ax_u * sa) * half
+            rx = (au * ca + av * sa) * half
+            ry = (av * ca - au * sa) * half
             coords.extend([wp - rx - ry, wp + rx - ry, wp + rx + ry, wp - rx + ry])
-            uvs.extend([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
-            rgba = (s.color[0], s.color[1], s.color[2], alpha)
+            if nframes > 1:
+                # flipbook: pick the frame from the life fraction, emit its UV sub-rect.
+                fr = min(int(u_life * nframes), nframes - 1)
+                cx, cy = fr % nx, fr // nx
+                u0, u1 = cx / nx, (cx + 1) / nx
+                # texture row 0 is the TOP; GPU uv v=0 is the BOTTOM, so flip the rows.
+                v1, v0 = 1.0 - cy / ny, 1.0 - (cy + 1) / ny
+                uvs.extend([(u0, v0), (u1, v0), (u1, v1), (u0, v1)])
+            else:
+                uvs.extend([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+            rgba = (pcol[0], pcol[1], pcol[2], alpha)
             cols.extend([rgba] * 4)
             b = n * 4
             indices.extend([(b, b + 1, b + 2), (b, b + 2, b + 3)])
@@ -948,9 +1351,8 @@ _last_frame = [None]
 
 
 def _cfg(props):
-    # world/force/friction/emission are calibrated at 1:1, spread is symmetric, yaw is
-    # negated, and the emitter forward is -fwd - all measured against the game, so they are
-    # fixed here rather than exposed as knobs that would only confuse. (See CHANGELOG.md.)
+    # world/force/friction/emission are calibrated 1:1, spread symmetric, yaw negated,
+    # forward -fwd - all measured, so fixed here rather than exposed as knobs.
     return {
         "world": 1.0,
         "force": 1.0,
@@ -1064,7 +1466,7 @@ class PPB_Props(bpy.types.PropertyGroup):
     axis_preset: bpy.props.EnumProperty(
         name="Axes",
         description="Which local axis is your mesh's forward/up. The emitter direction and "
-                    "billboard=no quads are oriented relative to it. Kaurava meshes are +Y fwd",
+                    "billboard=no quads are oriented relative to it. Default is +Y fwd",
         items=[
             ("Y_FWD_Z_UP", "+Y fwd, +Z up", ""),
             ("NEG_Y_FWD_Z_UP", "-Y fwd, +Z up", ""),
@@ -1080,14 +1482,15 @@ class PPB_Props(bpy.types.PropertyGroup):
         default=0, min=0, max=120, update=_on_knob_change,
     )
 
+
+
     bg_luminance: bpy.props.FloatProperty(
         name="Scene background",
         description="Fill the empty background with a flat grey of this luminance to judge how "
                     "ADDITIVE effects read against the game's scene instead of a black viewport. "
-                    "0 = dark (every faint additive layer shows). The mod's terrain is fairly grey "
-                    "city, so ~0.3-0.4 matches it; 0.6+ already reads near-white. A linear "
-                    "approximation, not the engine's exact tonemap - it will not match the game "
-                    "pixel for pixel.",
+                    "0 = dark (every faint additive layer shows); ~0.3-0.4 approximates a typical "
+                    "mid scene; 0.6+ reads near-white. A linear approximation, not the engine's "
+                    "exact tonemap - it will not match the game pixel for pixel.",
         default=0.0, min=0.0, max=1.0, update=_on_display_change,
     )
 
@@ -1152,6 +1555,27 @@ class PPB_OT_reset(bpy.types.Operator):
     bl_description = "Restart the simulation from frame start"
 
     def execute(self, context):
+        load_constants()
+        _last_frame[0] = None
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_reroll(bpy.types.Operator):
+    bl_idname = "pdx_pb.reroll"
+    bl_label = "Re-roll"
+    bl_description = (
+        "Draw a different random outcome - new spawn directions, lifetimes, spreads and "
+        "turbulence timings. The preview stays deterministic WITHIN a roll, so scrubbing the "
+        "timeline replays exactly the same thing; this is how to see the variety the game "
+        "shows every time an effect restarts, instead of judging a single fixed outcome"
+    )
+
+    def execute(self, context):
+        # same generator, different stream. Deterministic within a roll keeps a scrub
+        # from flickering; judging a random effect off one outcome is the trap this avoids.
+        SIM.seed = (SIM.seed * 1103515245 + 12345) & 0x7FFFFFFF
         _last_frame[0] = None
         update_sim(context.scene, force_reset=True)
         _tag_redraw()
@@ -1159,13 +1583,8 @@ class PPB_OT_reset(bpy.types.Operator):
 
 
 class PPB_OT_mute_sub(bpy.types.Operator):
-    """Hide one subsystem so the rest can be read on its own.
-
-    An effect is a stack of subsystems drawn on top of each other, and a big
-    camera-facing fire mass will happily bury a thin oriented quad underneath it.
-    Without a way to take layers away, "the ring looks wrong" cannot be told apart
-    from "the ring is fine and you are looking at the fireball in front of it".
-    """
+    """Hide one subsystem so the rest can be read on its own - an effect stacks
+    subsystems, and a big camera-facing fire mass buries thin quads underneath."""
 
     bl_idname = "pdx_pb.mute_sub"
     bl_label = "Mute Subsystem"
@@ -1207,10 +1626,9 @@ class PPB_OT_show_all_subs(bpy.types.Operator):
 
 
 def _find_pdx():
-    # io_pdx_mesh may be a legacy add-on ("io_pdx_mesh") or a Blender 4.2+ extension
-    # ("bl_ext.<repo>.io_pdx_mesh"), so a hard-coded `import io_pdx_mesh` fails for the
-    # extension. Find the already-loaded modules by name-tail instead. Returns
-    # (blender_import_export module, io_pdx top-level module); either may be None.
+    # io_pdx_mesh may be a legacy add-on or a Blender 4.2+ extension (different module
+    # names), so find the already-loaded modules by name-tail. Returns (bie, top),
+    # either may be None.
     import sys
 
     bie = top = None
@@ -1225,10 +1643,8 @@ def _find_pdx():
 
 
 def _import_in_view3d(meshpath, import_meshfile):
-    # import_meshfile runs bpy.ops internally (mode_set to enter edit mode for bones, join
-    # for multi-material meshes). A bare timer callback has no VIEW_3D context, so those
-    # ops quietly no-op - leaving an empty rig and no mesh. Run under a temp_override onto
-    # the first VIEW_3D area so they behave as they do from the UI.
+    # import_meshfile runs bpy.ops that need a VIEW_3D context (mode_set, join); a bare
+    # timer has none, so run under a temp_override onto the first VIEW_3D area.
     override = None
     for win in bpy.context.window_manager.windows:
         area = next((a for a in win.screen.areas if a.type == "VIEW_3D"), None)
@@ -1265,8 +1681,8 @@ class PPB_OT_roundtrip(bpy.types.Operator):
         if bie is None or top is None:
             self.report({"ERROR"}, "io_pdx_mesh add-on not found - is it enabled?")
             return {"CANCELLED"}
-        # Require the .blend saved and clean, so nothing a .mesh export cannot carry
-        # (modifiers, extra objects, edit history) is lost when the session is replaced.
+        # require the .blend saved and clean - round-trip replaces the session, so
+        # anything a .mesh export cannot carry (modifiers, extra objects) would be lost.
         if not bpy.data.filepath or bpy.data.is_dirty:
             self.report(
                 {"ERROR"},
@@ -1280,10 +1696,8 @@ class PPB_OT_roundtrip(bpy.types.Operator):
         prev_mtime = os.path.getmtime(prev) if prev and os.path.isfile(prev) else -1.0
         t0 = time.time()
 
-        # Hand off to io_pdx_mesh's real export dialog (its own options). Another operator's
-        # modal dialog gives no completion callback, so watch the path it records in
-        # last_export_mesh: once that points to a file freshly written since we started, the
-        # export succeeded -> swap to a fresh file and import it.
+        # Hand off to io_pdx_mesh's export dialog. It gives no completion callback, so
+        # watch last_export_mesh; once it points to a freshly written file, import it.
         bpy.ops.io_pdx_mesh.export_mesh("INVOKE_DEFAULT")
 
         def _await_export():
@@ -1298,8 +1712,7 @@ class PPB_OT_roundtrip(bpy.types.Operator):
                 if mtime >= t0 - 2.0 and (cur != prev or mtime > prev_mtime):
                     path = cur
                     bpy.ops.wm.read_homefile(use_empty=True)
-                    # Import on the NEXT tick (let the fresh file settle) and under a
-                    # VIEW_3D override, so import_meshfile's internal ops actually run.
+                    # import on the next tick, under a VIEW_3D override (see _import_in_view3d).
                     bpy.app.timers.register(
                         lambda: _import_in_view3d(path, import_meshfile),
                         first_interval=0.1,
@@ -1329,10 +1742,8 @@ class PPB_PT_panel(bpy.types.Panel):
         if not prefs or not (prefs.mod_root or prefs.vanilla_root):
             layout.label(text="Set mod/vanilla roots in Add-on Preferences", icon="ERROR")
 
-        # Blender 4.x defaults to the AgX view transform, which deliberately
-        # desaturates saturated colour as it brightens. Harmless for artwork, but
-        # this add-on is a measuring instrument: under AgX a red or magenta effect
-        # reads noticeably duller here than the same effect does in game.
+        # Blender 4.x defaults to the AgX view transform, which desaturates saturated
+        # colour; this is a measuring instrument, so warn to switch to Standard.
         if context.scene.view_settings.view_transform != "Standard":
             layout.label(text="Colour is tone-mapped by view transform", icon="INFO")
             layout.label(text="Render > Color Management > Standard to compare")
@@ -1349,6 +1760,7 @@ class PPB_PT_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("pdx_pb.load", icon="FILE_REFRESH")
         row.operator("pdx_pb.reset", icon="LOOP_BACK")
+        row.operator("pdx_pb.reroll", icon="MOD_NOISE")
         layout.prop(props, "enabled")
 
         effect = SIM.effect
@@ -1372,10 +1784,18 @@ class PPB_PT_panel(bpy.types.Panel):
             ).index = i
             row.operator("pdx_pb.solo_sub", text="", icon="RADIOBUT_ON").index = i
             sub = row.row(align=True)
-            sub.active = not hidden
+            sub.active = not hidden and s.enabled
+            # spell out an asset-level hide/trail, else the row just reads 0/max and
+            # looks like an unexplained "nothing spawning".
+            if s.hide:
+                state = "hide=yes (off in game)"
+            elif s.trail:
+                state = "trail=yes (drops it in game)"
+            else:
+                state = "%d/%d" % (s.live, s.max_amount)
             sub.label(
-                text="%s  %d/%d  %s"
-                % (s.name, s.live, s.max_amount, "ADD" if s.additive else "ALPHA")
+                text="%s  %s  %s"
+                % (s.name, state, "ADD" if s.additive else "ALPHA")
             )
 
         for msg in effect.lints():
@@ -1393,9 +1813,8 @@ class PPB_PT_panel(bpy.types.Panel):
         note.label(text="Approximation, not an exact game match", icon="INFO")
         note.label(text="(different, older engine + render pipeline).")
 
-        # Which build is actually running. This add-on tends to exist in several
-        # copies at once (repo, Blender's addons dir, a mod's tools folder), and
-        # editing one does not change what Blender loaded.
+        # which build is running - this add-on tends to exist in several copies at once
+        # (repo, Blender's addons dir, a mod's tools folder).
         layout.separator()
         row = layout.row()
         row.alignment = "RIGHT"
@@ -1408,6 +1827,7 @@ CLASSES = (
     PPB_OT_browse,
     PPB_OT_load,
     PPB_OT_reset,
+    PPB_OT_reroll,
     PPB_OT_mute_sub,
     PPB_OT_solo_sub,
     PPB_OT_show_all_subs,
@@ -1418,6 +1838,7 @@ CLASSES = (
 
 def register():
     global _draw_handle
+    load_constants()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.pdx_pb = bpy.props.PointerProperty(type=PPB_Props)

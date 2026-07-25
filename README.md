@@ -2,130 +2,48 @@
 
 Blender tooling for Paradox / Clausewitz asset work - currently Hearts of Iron IV.
 
-Two independent add-ons live here, each in its own folder - install whichever you need:
+Two independent add-ons, each in its own folder - install whichever you need:
 
 | | |
 |---|---|
 | [`io_pdx_mesh/`](io_pdx_mesh/) | a fork of ross-g's mesh/anim importer-exporter, fixed for Blender 4.x and extended with rigging helpers |
 | [`pdx_particle_bench/`](pdx_particle_bench/) | preview a particle `.asset` attached to a real locator, with the engine's simulation constants |
 
-**Scope: Blender only, Hearts of Iron IV only.** The fork drops upstream's Maya half
-and its other game profiles rather than shipping code nobody here tests - see
-[`io_pdx_mesh/CHANGES.md`](io_pdx_mesh/CHANGES.md) items 6 and 7 if you need them back.
-
----
+**Scope: Blender only, Hearts of Iron IV only.**
 
 ## io_pdx_mesh fork
 
-Upstream [io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh) has had no release
-since **2024-09-23 (v0.91)** and does not run correctly on Blender 4.x. This fork
-exists to keep it working.
-
-**Fixed here:**
-
-- **Import crashed on any multi-material mesh.** Blender 4.0 removed context-override
-  dicts as operator arguments; upstream still uses one for `object.join`, so the
-  import aborts with `ValueError: 1-2 args execution context is supported`.
-- **Meshes imported completely flat-shaded.** A Blender 4.1 removal (`use_auto_smooth`)
-  raised inside a `try` that also contained the `use_smooth` call, so face smoothing was
-  silently skipped. Custom normals loaded but were never used - models looked faceted
-  and did not match the game.
-- **Static mesh pivots were destroyed on export.** `matrix_world` was baked into every
-  exported mesh; correct for skinned meshes, wrong for standalone ones such as weapons
-  attached to a bone.
-- **The auto-updater was removed.** Upstream's Info panel offers a one-click *UPDATE*
-  button pointing at the latest upstream release - which in a fork would replace this
-  build with the very version whose bugs it fixes.
-
-Plus four general rigging operators (orient bone to cursor, flip bone, align weapon by
-two points, extract selection to a new `.blend`).
-
-Full detail, including before/after measurements: [`io_pdx_mesh/CHANGES.md`](io_pdx_mesh/CHANGES.md).
+Upstream [io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh) has had no release since
+**2024-09-23 (v0.91)** and does not run correctly on Blender 4.x. This fork fixes the 4.x import
+crash, flat shading and export-pivot bugs, resolves textures across the whole `models/` tree,
+drops the Maya half and other game profiles, and adds four rigging operators (orient bone, flip
+bone, align weapon, extract to `.blend`). Full list: [`io_pdx_mesh/CHANGES.md`](io_pdx_mesh/CHANGES.md).
 
 ## PDX Particle Bench
 
-Particle `.asset` files are normally authored blind - edit, launch the game, look,
-repeat. This add-on parses the `.asset`, simulates it, and draws it **attached to a
-locator on the actual mesh**, so timing, size and direction can be judged without a
-launch.
-
-Its constants were **measured against the game**, not guessed. With every slider at
-1.0 the simulation matched:
-
-| Parameter | Finding |
-|---|---|
-| `velocity` | world units 1:1 |
-| planar force | acceleration in units/s^2 |
-| friction | exponential decay, `v *= exp(-amount*dt)` |
-| `size` | quad size in world units |
-| `{base spread}` | symmetric +/-, not one-sided |
-| `emission` | the engine spawns **~3x** a literal "particles/second" reading |
-| entity `scale` | scales the **particles too**, not just the mesh |
-
-The `.asset` axis conventions likewise had to be measured, and they are not uniform:
-`position` maps `(x, y, z)` to *(forward, up, right)* with forward inverted, while force
-`direction` maps to the locator's local *(X, Z, Y)*. `local_force=no` does **not** mean
-world space - the bone's rest rotation applies either way.
-
-It also warns about engine traps a preview cannot show by construction, such as mixing
-`local_space=yes/no` with alpha-blended subsystems, which makes HoI4 silently drop them.
-
-`billboard=no` quads are oriented the way the engine orients them, including the
-non-obvious part: the in-plane axis at `rotation=0` is the emitter's *side* axis, not
-the direction of fire - so a quad meant to run along the shot in the `pitch=90` plane
-needs `rotation={ 90 0 }`. That was established by sweeping `rotation` in game rather
-than reasoned about, after two plausible-looking guesses both turned out wrong.
-
-Rendering uses Blender's `gpu` module rather than EEVEE materials - the only way to get
-true additive blending, which most of these effects rely on. It is viewport-only by
-design: a measuring instrument, not a render path.
-
-It does **not** promise a pixel-exact match with the game, and by design cannot. What is
-calibrated is the *simulation*: a particle's position, velocity, size, count, lifetime,
-direction and timing all match the game 1:1. What it cannot reproduce is the game's
-*presentation* - HoI4 composites each effect into an already-lit scene and then runs the
-whole frame through post-processing (HDR tonemapping, bloom, colour-grading LUTs, fog), so
-an additive layer's on-screen colour depends on the tonemapped terrain behind it and the
-bloom around it, none of which exist in an isolated preview. The bench draws effects on
-their own through the `gpu` module's additive blend, with Blender's own view transform on
-top. Replicating that pipeline is out of scope: the bench measures what an effect *does*,
-not the exact pixels it resolves to on screen.
-
-Version history and the full list of known limitations:
-[`pdx_particle_bench/CHANGELOG.md`](pdx_particle_bench/CHANGELOG.md). The running
-version is shown at the bottom of the add-on's panel - worth checking, since this
-add-on tends to exist in several copies at once and editing one does not change what
-Blender loaded.
-
----
+Particle `.asset` files are normally authored blind - edit, launch the game, look, repeat (Or using old game version with -editor). This
+add-on parses the `.asset`, simulates it, and draws it **attached to a locator on the real mesh**,
+so timing, size and direction can be judged without a launch. Its simulation constants and axis
+conventions were **measured against the game**, not guessed; it draws through Blender's `gpu`
+module for true additive blending and is viewport-only (calibrated for the simulation, not the
+game's post-processed on-screen colour). Version history and known limitations:
+[`pdx_particle_bench/CHANGELOG.md`](pdx_particle_bench/CHANGELOG.md).
 
 ## Install
 
-Both are ordinary Blender add-ons (tested on **4.2**).
+Both are ordinary Blender add-ons (tested on **4.2**). Each is a self-contained folder: zip it and
+install via `Edit > Preferences > Add-ons > Install...`, or copy it into Blender's
+`scripts/addons/`, then restart. Both panels appear in the 3D view sidebar (<kbd>N</kbd>) under
+**PDX Blender Tools**.
 
-Each add-on is a self-contained folder. Zip the folder you want and install the zip via
-`Edit > Preferences > Add-ons > Install...`, or copy the folder straight into Blender's
-`scripts/addons/`. Restart Blender afterwards. Installing one does not pull in the other.
-
-- **`pdx_particle_bench/`** - after enabling it, set **Mod root** and **Vanilla root** in
-  its add-on preferences. `.asset` texture paths are game-relative, so they are resolved
-  mod-first then vanilla, exactly as the game resolves them; most particle textures live
-  in the vanilla install rather than in a mod.
-  Also set `Render > Color Management > View Transform` to **Standard**. Blender 4.x
-  defaults to AgX, which desaturates bright colour - fine for artwork, misleading when
-  you are comparing an effect against a screenshot. The panel warns if it is not set.
-- **`io_pdx_mesh/`** - if you already have upstream installed, replace that folder with
-  this one.
-
-Both panels appear in the 3D view sidebar (<kbd>N</kbd>) under **PDX Blender Tools**.
+For `pdx_particle_bench/`, set **Mod root** and **Vanilla root** in its preferences (texture paths
+resolve mod-first then vanilla, as the game does), and set the view transform to **Standard**
+(Blender 4.x defaults to AgX, which desaturates colour and misleads a comparison).
 
 ## License
 
-**GPL-3.0-or-later.**
-
-`io_pdx_mesh/` is a modified copy of [io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh),
-copyright (C) ross-g, used and redistributed under GPL-3.0-or-later. Modifications are
-listed in [`io_pdx_mesh/CHANGES.md`](io_pdx_mesh/CHANGES.md) and marked inline with
-`# FORK:`. The original license text is kept at `io_pdx_mesh/license.txt`.
-
-Everything else here is GPL-3.0-or-later as well - Blender add-ons using `bpy` have to be.
+**GPL-3.0-or-later.** `io_pdx_mesh/` is a modified copy of
+[io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh), copyright (C) ross-g, redistributed under
+GPL-3.0-or-later; modifications are in [`io_pdx_mesh/CHANGES.md`](io_pdx_mesh/CHANGES.md), marked
+inline with `# FORK:`, and the original license text is at `io_pdx_mesh/license.txt`. Everything
+else is GPL-3.0-or-later too - Blender add-ons using `bpy` have to be.

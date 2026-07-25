@@ -1,17 +1,10 @@
 """
-Background Blender script used by IOPDX_OT_extract_selected_to_blend.
-
-Invoked by the operator through a subprocess call:
+Background Blender script for IOPDX_OT_extract_selected_to_blend - runs in a throwaway
+--background subprocess, never imported by the addon. Invoked as:
     blender.exe --background <original.blend> --python <this_script> -- \\
         <new_blend_path> <obj_name_1> <obj_name_2> ...
-
-When Blender runs --background with a filepath, that file is loaded before
---python fires, so we arrive here with the original scene already in
-bpy.data. Our job is to strip everything except the objects named in
-sys.argv, purge orphan data blocks, and save-as to the new path.
-
-This script is NOT imported by the Blender addon. It only runs in a
-throwaway subprocess.
+The original scene is already loaded when we arrive; we strip everything except the
+named objects, purge orphans, and save-as to the new path.
 """
 
 import sys
