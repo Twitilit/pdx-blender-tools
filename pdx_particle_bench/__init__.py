@@ -10,7 +10,7 @@
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 6, 1),
+    "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > Particle Bench",
     "description": "Preview and edit Clausewitz/HoI4 .asset particle effects on a real locator",
@@ -641,10 +641,12 @@ class Instance:
                 continue
             if not s.enabled or s.duration == 0:
                 continue
-            in_window = t_local >= s.start and (
-                s.duration < 0 or t_local < s.start + s.duration
-            )
-            if not in_window:
+            # Emit over this step's OVERLAP with the window, not a point-in-window test:
+            # a burst shorter than ~2 steps (multilaser duration=0.012 < 2*FIXED_DT) would
+            # otherwise spawn only on the fraction of fire phases that land two steps inside.
+            win_end = t_local if s.duration < 0 else s.start + s.duration
+            emit_dt = min(t_local, win_end) - max(t_local - dt, s.start)
+            if emit_dt <= 1e-12:
                 continue
             if s.pulsed:
                 if self.pulse[si] is None:
@@ -666,7 +668,7 @@ class Instance:
                     # fraction (not frozen per particle). min/max still remap.
                     phase = (t_local - s.start) / anim["dur"]
                     rate = apply_anim(s.emission, anim, min(max(phase, 0.0), 1.0))
-            self.budget[si] += rate * ENGINE_EMISSION_MUL * cfg["emission"] * dt
+            self.budget[si] += rate * ENGINE_EMISSION_MUL * cfg["emission"] * emit_dt
             while self.budget[si] >= 1.0:
                 self.budget[si] -= 1.0
                 if self.count[si] >= s.max_amount:
@@ -774,13 +776,12 @@ class Instance:
                 cs = eff.subs[ci]
                 if not cs.enabled or cs.duration == 0:
                     continue
-                in_win = p.age >= cs.start and (
-                    cs.duration < 0 or p.age < cs.start + cs.duration
-                )
-                if not in_win:
+                win_end = p.age if cs.duration < 0 else cs.start + cs.duration
+                emit_dt = min(p.age, win_end) - max(p.age - dt, cs.start)
+                if emit_dt <= 1e-12:
                     continue
                 b = p.child_budget.get(ci, 0.0) + (
-                    cs.emission * ENGINE_EMISSION_MUL * cfg["emission"] * dt
+                    cs.emission * ENGINE_EMISSION_MUL * cfg["emission"] * emit_dt
                 )
                 while b >= 1.0:
                     b -= 1.0
@@ -988,6 +989,119 @@ class Sim:
 
 
 SIM = Sim()
+
+
+class Track:
+    """One timeline event: a parsed effect fired at a node on its own schedule.
+    Reuses Instance for the particle work; only the firing schedule differs from Sim."""
+
+    def __init__(self, effect, target, start_t, end_t, mode, rate_t, seed):
+        self.effect = effect
+        self.target = target      # the Object (empty/locator) this effect rides
+        self.start_t = start_t
+        self.end_t = end_t
+        self.mode = mode          # ONESHOT | CONTINUOUS | REPEAT
+        self.rate_t = rate_t      # seconds between refires (REPEAT)
+        self.seed = seed
+        self.instances = []
+        self._fired = set()
+        self.rng = random.Random(seed)
+
+    def reset(self):
+        self.instances = []
+        self._fired = set()
+        self.rng = random.Random(self.seed)
+        for s in self.effect.subs:
+            s.live = 0
+
+    def _due(self, t_abs):
+        """Absolute fire-times that should have happened by t_abs (one-shot: just start)."""
+        if self.mode == "REPEAT":
+            out, ft, guard = [], self.start_t, 0
+            while ft <= min(t_abs, self.end_t) + 1e-9 and guard < 100000:
+                out.append(round(ft, 6))
+                ft += max(self.rate_t, 1e-3)
+                guard += 1
+            return out
+        return [round(self.start_t, 6)] if t_abs >= self.start_t - 1e-9 else []
+
+    def _fire_due(self, t_abs):
+        for ft in self._due(t_abs):
+            if ft not in self._fired:
+                self._fired.add(ft)
+                self.instances.append(Instance(self.effect, ft))
+
+    def step(self, dt, t_abs, cfg, emitter_mat):
+        self._fire_due(t_abs)
+        for inst in self.instances:
+            inst.step(dt, t_abs, cfg, self.rng, emitter_mat)
+        self.instances = [i for i in self.instances if not i.done]
+
+
+class TimelinePlayer:
+    """Plays all timeline events as independent tracks (multi-effect, multi-node)."""
+
+    def __init__(self):
+        self.tracks = []
+        self.sig = None
+        self.t = 0.0
+
+    def _sig(self, props, fps):
+        return tuple(
+            (e.asset, e.enabled, e.start_frame, e.end_frame, e.mode, e.rate,
+             e.target.name if e.target else "")
+            for e in props.events
+        ) + (round(fps, 4),)
+
+    def build(self, props, fps, frame_start, seed):
+        """(Re)parse each enabled event into its own effect + track."""
+        self.tracks = []
+        for i, e in enumerate(props.events):
+            if not e.enabled or not e.asset:
+                continue
+            path = bpy.path.abspath(e.asset)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8-sig") as fh:
+                    eff = Effect(fh.read())
+            except Exception:  # noqa: BLE001 - a bad file just drops its track
+                continue
+            start_t = (e.start_frame - frame_start) / fps
+            end_t = (e.end_frame - frame_start) / fps
+            if e.mode == "CONTINUOUS":
+                # bound an infinite emitter to the [start, end] window (this track owns eff).
+                win = max(0.0, end_t - start_t)
+                for s in eff.subs:
+                    if s.duration < 0:
+                        s.duration = win
+            self.tracks.append(
+                Track(eff, e.target, start_t, end_t, e.mode,
+                      max(e.rate, 1) / fps, seed + i * 101)
+            )
+        self.sig = self._sig(props, fps)
+
+    def reset(self, props, fps, frame_start, seed):
+        if self.sig != self._sig(props, fps) or not self.tracks:
+            self.build(props, fps, frame_start, seed)
+        for tr in self.tracks:
+            tr.reset()
+            tr._fire_due(0.0)  # spawn any start=0 firing so frame 0 shows it (like Sim.reset)
+        self.t = 0.0
+
+    def advance_to(self, target, cfg):
+        """Step every track to `target` seconds. Caller resets first when seeking back."""
+        mats = [(tr, tr.target.matrix_world.copy() if tr.target else None)
+                for tr in self.tracks]
+        steps = 0
+        while self.t < target - 1e-9 and steps < MAX_STEPS_PER_UPDATE:
+            self.t += FIXED_DT
+            for tr, mat in mats:
+                tr.step(FIXED_DT, self.t, cfg, mat)
+            steps += 1
+
+
+TIMELINE = TimelinePlayer()
 
 
 # =============================================================================
@@ -1224,15 +1338,11 @@ def _oriented_axes(pyaw_deg, ppitch_deg, axis_key, flip_yaw, flip_plume, rot3):
 
 
 def draw_callback():
-    effect = SIM.effect
-    if effect is None:
-        return
     ctx = bpy.context
     scene = ctx.scene
     props = scene.pdx_pb
     if not props.enabled:
         return
-
     region_3d = ctx.region_data
     if region_3d is None:
         return
@@ -1242,13 +1352,25 @@ def draw_callback():
     cam_right = Vector((view_mat[0][0], view_mat[0][1], view_mat[0][2]))
     cam_up = Vector((view_mat[1][0], view_mat[1][1], view_mat[1][2]))
 
-    emitter_mat = props.target.matrix_world if props.target else None
+    if props.play_timeline:  # multi-track: each event's effect at its own node
+        for tr in TIMELINE.tracks:
+            mat = tr.target.matrix_world if tr.target else None
+            _draw_effect(tr.effect, tr.instances, mat, set(),
+                         props, region_3d, cam_right, cam_up)
+        return
+    if SIM.effect is not None:
+        mat = props.target.matrix_world if props.target else None
+        _draw_effect(SIM.effect, SIM.instances, mat, SIM.muted,
+                     props, region_3d, cam_right, cam_up)
+
+
+def _draw_effect(effect, instances, emitter_mat, muted, props, region_3d, cam_right, cam_up):
     emitter_rot = emitter_mat.to_3x3() if emitter_mat else None
     size_gain = 1.0  # size is world units 1:1 (calibrated); no user knob
 
     # Bucket by subsystem so each can use its own blend mode.
     buckets = {}
-    for inst in SIM.instances:
+    for inst in instances:
         for p in inst.parts:
             s = effect.subs[p.si]
             if not s.enabled:
@@ -1287,7 +1409,7 @@ def draw_callback():
     gpu.state.depth_mask_set(False)
 
     for si, items in buckets.items():
-        if si in SIM.muted:
+        if si in muted:
             continue
         s = effect.subs[si]
         # Painter's order for alpha-blended smoke; additive is order-independent.
@@ -1370,8 +1492,6 @@ def _cfg(props):
 
 
 def update_sim(scene, force_reset=False):
-    if SIM.effect is None:
-        return
     props = scene.pdx_pb
     if not props.enabled:
         return
@@ -1379,8 +1499,16 @@ def update_sim(scene, force_reset=False):
     fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
     target = (scene.frame_current - scene.frame_start) / max(fps, 1e-6)
 
-    emitter_mat = props.target.matrix_world.copy() if props.target else None
+    if props.play_timeline:  # multi-track timeline (independent of the editor effect)
+        if force_reset or _last_frame[0] is None or target < TIMELINE.t - 1e-9:
+            TIMELINE.reset(props, fps, scene.frame_start, SIM.seed)
+        _last_frame[0] = scene.frame_current
+        TIMELINE.advance_to(target, cfg)
+        return
 
+    if SIM.effect is None:
+        return
+    emitter_mat = props.target.matrix_world.copy() if props.target else None
     # Deterministic: stepping backwards or jumping re-sims from zero.
     if force_reset or _last_frame[0] is None or target < SIM.t - 1e-9:
         SIM.reset(cfg)
@@ -2063,6 +2191,38 @@ class PPB_AnimProps(bpy.types.PropertyGroup):
     repeat: bpy.props.BoolProperty(name="Repeat", update=_on_anim_edit)
 
 
+def _on_event_edit(self, context):
+    _last_frame[0] = None
+    update_sim(context.scene, force_reset=True)
+    _tag_redraw()
+
+
+class PPB_EventProps(bpy.types.PropertyGroup):
+    """One timeline event: an .asset fired at a node, at a frame."""
+    name: bpy.props.StringProperty(default="event")
+    asset: bpy.props.StringProperty(
+        name="Asset", description="The .asset to fire (use the folder button)", update=_on_event_edit)
+    target: bpy.props.PointerProperty(
+        name="Node", type=bpy.types.Object, update=_on_event_edit,
+        description="Empty/locator the effect rides (from the imported mesh)")
+    start_frame: bpy.props.IntProperty(
+        name="Start", default=0, description="Frame the effect fires", update=_on_event_edit)
+    mode: bpy.props.EnumProperty(
+        name="Mode", default="ONESHOT", update=_on_event_edit,
+        items=[
+            ("ONESHOT", "One-shot", "Fire once at Start, play its natural length"),
+            ("CONTINUOUS", "Continuous", "Emit from Start to End (for duration=-1 effects)"),
+            ("REPEAT", "Repeat", "Re-fire the whole effect every Rate frames, Start to End"),
+        ])
+    end_frame: bpy.props.IntProperty(
+        name="End", default=48, description="Frame emission stops (Continuous/Repeat)",
+        update=_on_event_edit)
+    rate: bpy.props.IntProperty(
+        name="Rate", default=6, min=1, description="Re-fire every N frames (Repeat)",
+        update=_on_event_edit)
+    enabled: bpy.props.BoolProperty(name="On", default=True, update=_on_event_edit)
+
+
 class PPB_Props(bpy.types.PropertyGroup):
     asset_path: bpy.props.StringProperty(
         name="Asset", description="HoI4 particle .asset file (use Browse, or paste a path)"
@@ -2079,12 +2239,20 @@ class PPB_Props(bpy.types.PropertyGroup):
     active_force: bpy.props.IntProperty(name="Active force", default=0)
     anims: bpy.props.CollectionProperty(type=PPB_AnimProps)
     active_anim: bpy.props.IntProperty(name="Active animation", default=0)
+    events: bpy.props.CollectionProperty(type=PPB_EventProps)
+    active_event: bpy.props.IntProperty(name="Active event", default=0)
+    play_timeline: bpy.props.BoolProperty(
+        name="Play timeline", default=False, update=_on_knob_change,
+        description="Play all timeline events at their nodes and frames, "
+                    "instead of the single edited effect",
+    )
     panel_tab: bpy.props.EnumProperty(
         name="Tab",
         items=[
             ("SUBS", "Subsystems", "Edit the effect's subsystems"),
             ("FORCES", "Forces", "Edit the shared force pool"),
             ("ANIMS", "Animations", "Edit the animation curves"),
+            ("TIMELINE", "Timeline", "Fire multiple effects at nodes over the animation"),
             ("SETTINGS", "Settings", "Preview axes, refire and display"),
         ],
         default="SUBS",
@@ -2122,6 +2290,38 @@ class PPB_Props(bpy.types.PropertyGroup):
     )
 
 
+# Session memory: each file dialog reopens where it last landed (per category), instead of
+# always at gfx/particles - handy once a machine's effects live in their own folder. The
+# gfx/particles default is used only until the first pick. Cleared on reload (new session).
+_last_browse = {}
+
+
+def _browse_default(vanilla_ok=False):
+    prefs = get_prefs()
+    if not prefs:
+        return ""
+    base = (prefs.vanilla_root if (vanilla_ok and prefs.browse_vanilla and prefs.vanilla_root)
+            else (prefs.mod_root or prefs.vanilla_root))
+    if base:
+        start = os.path.join(bpy.path.abspath(base), "gfx", "particles")
+        if os.path.isdir(start):
+            return os.path.join(start, "")
+    return ""
+
+
+def _browse_start(key, vanilla_ok=False):
+    last = _last_browse.get(key)
+    if last and os.path.isdir(last):
+        return os.path.join(last, "")  # trailing sep: open INSIDE the folder
+    return _browse_default(vanilla_ok)
+
+
+def _browse_remember(key, filepath):
+    d = os.path.dirname(bpy.path.abspath(filepath))
+    if d and os.path.isdir(d):
+        _last_browse[key] = d
+
+
 class PPB_OT_browse(bpy.types.Operator):
     bl_idname = "pdx_pb.browse"
     bl_label = "Browse"
@@ -2133,17 +2333,12 @@ class PPB_OT_browse(bpy.types.Operator):
     filter_glob: bpy.props.StringProperty(default="*.asset", options={"HIDDEN"})
 
     def invoke(self, context, event):
-        prefs = get_prefs()
-        if prefs:
-            base = prefs.vanilla_root if prefs.browse_vanilla else prefs.mod_root
-            if base:
-                start = os.path.join(bpy.path.abspath(base), "gfx", "particles")
-                if os.path.isdir(start):
-                    self.filepath = start + os.sep
+        self.filepath = _browse_start("asset", vanilla_ok=True)
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
+        _browse_remember("asset", self.filepath)
         context.scene.pdx_pb.asset_path = self.filepath
         return bpy.ops.pdx_pb.load()
 
@@ -2351,8 +2546,9 @@ def _refire_lints(effect, refire, frame_dt):
     continuous = any(s.enabled and s.duration < 0.0 for s in effect.subs)
     if refire <= 0 and subframe:
         out.append((
-            "Sub-frame one-shot (duration < 1 frame) shows nothing at Refire 0 - set "
-            "Refire >= 1, or park the playhead on the firing frame", "INFO"))
+            "Sub-frame one-shot (duration < 1 frame): so brief that at Refire 0 it may not "
+            "show unless the playhead is on the firing frame - set Refire >= 1, or park it there",
+            "INFO"))
     if refire > 0 and continuous:
         out.append((
             "Refire stacks continuous emitters (duration=-1): live count runs past "
@@ -3000,17 +3196,12 @@ class PPB_OT_browse_texture(bpy.types.Operator):
     filter_glob: bpy.props.StringProperty(default="*.dds", options={"HIDDEN"})
 
     def invoke(self, context, event):
-        prefs = get_prefs()
-        base = (prefs.vanilla_root if prefs and prefs.browse_vanilla else
-                (prefs.mod_root if prefs else ""))
-        if base:
-            start = os.path.join(bpy.path.abspath(base), "gfx", "particles")
-            if os.path.isdir(start):
-                self.filepath = start + os.sep
+        self.filepath = _browse_start("texture", vanilla_ok=True)
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
+        _browse_remember("texture", self.filepath)
         props = context.scene.pdx_pb
         if 0 <= props.active_sub < len(props.subsystems):
             props.subsystems[props.active_sub].tex_file = _to_game_relative(self.filepath)
@@ -3412,6 +3603,135 @@ def _draw_anims_tab(layout, context):
     layout.label(text="A curve applies to the fields that reference it", icon="INFO")
 
 
+class PPB_UL_events(bpy.types.UIList):
+    """Timeline events - one row each: on/off, label, timing (encodes the mode), node."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        body = row.row(align=True)
+        body.active = item.enabled
+        label = os.path.basename(item.asset) if item.asset else (item.name or "(no asset)")
+        body.label(text=label, icon="PARTICLES")
+        if item.mode == "ONESHOT":  # timing string doubles as the mode indicator
+            timing = "f%d" % item.start_frame
+        elif item.mode == "CONTINUOUS":
+            timing = "f%d-%d" % (item.start_frame, item.end_frame)
+        else:  # REPEAT
+            timing = "f%d-%d/%d" % (item.start_frame, item.end_frame, item.rate)
+        body.label(text=timing)
+        body.label(text=item.target.name if item.target else "(no node)")
+
+
+class PPB_OT_event_add(bpy.types.Operator):
+    bl_idname = "pdx_pb.event_add"
+    bl_label = "Add event"
+    bl_description = "Add a timeline event (an .asset fired at a node at a frame)"
+
+    def execute(self, context):
+        props = context.scene.pdx_pb
+        ev = props.events.add()
+        ev.name = "event %d" % len(props.events)
+        ev.start_frame = context.scene.frame_current
+        if props.target:
+            ev.target = props.target
+        if props.asset_path:
+            ev.asset = props.asset_path
+        props.active_event = len(props.events) - 1
+        _on_event_edit(ev, context)
+        return {"FINISHED"}
+
+
+class PPB_OT_event_delete(bpy.types.Operator):
+    bl_idname = "pdx_pb.event_delete"
+    bl_label = "Delete event"
+    bl_description = "Remove the selected timeline event"
+
+    def execute(self, context):
+        props = context.scene.pdx_pb
+        if 0 <= props.active_event < len(props.events):
+            props.events.remove(props.active_event)
+            props.active_event = max(0, min(props.active_event, len(props.events) - 1))
+            _on_event_edit(props, context)
+        return {"FINISHED"}
+
+
+class PPB_OT_event_browse(bpy.types.Operator):
+    bl_idname = "pdx_pb.event_browse"
+    bl_label = "Browse .asset"
+    bl_description = "Pick the .asset for the selected event"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.asset", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        self.filepath = _browse_start("asset")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        _browse_remember("asset", self.filepath)
+        props = context.scene.pdx_pb
+        if 0 <= props.active_event < len(props.events):
+            ev = props.events[props.active_event]
+            if not ev.name or ev.name.startswith("event"):
+                ev.name = os.path.splitext(os.path.basename(self.filepath))[0]
+            ev.asset = self.filepath  # fires _on_event_edit
+        return {"FINISHED"}
+
+
+def _timeline_lints(props):
+    """(message, is_error) for enabled events that will not play as expected."""
+    out = []
+    for i, e in enumerate(props.events):
+        if not e.enabled:
+            continue
+        tag = e.name or ("event %d" % (i + 1))
+        if not e.asset:
+            out.append(("%s: no .asset chosen" % tag, True))
+            continue
+        if not os.path.isfile(bpy.path.abspath(e.asset)):
+            out.append(("%s: .asset not found on disk" % tag, True))
+        if not e.target:
+            out.append(("%s: no node - plays at the world origin" % tag, False))
+        if e.mode in ("CONTINUOUS", "REPEAT") and e.end_frame <= e.start_frame:
+            out.append(("%s: End <= Start (nothing emitted)" % tag, True))
+    return out
+
+
+def _draw_timeline_tab(layout, context):
+    props = context.scene.pdx_pb
+    layout.prop(props, "play_timeline", toggle=True,
+                icon="PLAY" if props.play_timeline else "SNAP_FACE")
+    if props.play_timeline:
+        layout.label(text="Playing - the single editor effect is hidden", icon="INFO")
+    elif props.events:
+        layout.label(text="Turn on Play timeline to preview here", icon="INFO")
+
+    row = layout.row()
+    row.template_list("PPB_UL_events", "", props, "events", props, "active_event", rows=4)
+    col = row.column(align=True)
+    col.operator("pdx_pb.event_add", text="", icon="ADD")
+    col.operator("pdx_pb.event_delete", text="", icon="REMOVE")
+    if 0 <= props.active_event < len(props.events):
+        ev = props.events[props.active_event]
+        box = layout.box()
+        r = box.row(align=True)
+        r.prop(ev, "asset", text="")
+        r.operator("pdx_pb.event_browse", text="", icon="FILEBROWSER")
+        box.prop(ev, "target")
+        box.prop(ev, "start_frame")
+        box.prop(ev, "mode")
+        if ev.mode in ("CONTINUOUS", "REPEAT"):
+            box.prop(ev, "end_frame")
+        if ev.mode == "REPEAT":
+            box.prop(ev, "rate")
+    else:
+        layout.label(text="Add effects, give each a node and a start frame", icon="INFO")
+
+    for msg, err in _timeline_lints(props):
+        _draw_lint(layout, context, msg, icon="ERROR" if err else "INFO", alert=err)
+
+
 class PPB_PT_panel(bpy.types.Panel):
     """Particle Bench - load, preview and edit a HoI4 .asset in the 3D-view sidebar."""
     bl_label = "Particle Bench"
@@ -3424,12 +3744,15 @@ class PPB_PT_panel(bpy.types.Panel):
         layout = self.layout
         props = context.scene.pdx_pb
         _draw_launcher(layout, context)
-        if SIM.effect is None:
-            layout.label(text="No effect loaded", icon="INFO")
-            return
         layout.separator()
         row = layout.row(align=True)
         row.prop(props, "panel_tab", expand=True)
+        if props.panel_tab == "TIMELINE":  # references files - works with no editor effect
+            _draw_timeline_tab(layout, context)
+            return
+        if SIM.effect is None:
+            layout.label(text="No effect loaded", icon="INFO")
+            return
         if props.panel_tab == "SETTINGS":
             _draw_settings_tab(layout, context)
         elif props.panel_tab == "FORCES":
@@ -3445,6 +3768,7 @@ CLASSES = (
     PPB_SubsystemProps,
     PPB_ForceProps,
     PPB_AnimProps,
+    PPB_EventProps,
     PPB_Props,
     PPB_OT_browse,
     PPB_OT_load,
@@ -3477,6 +3801,10 @@ CLASSES = (
     PPB_UL_subsystems,
     PPB_UL_forces,
     PPB_UL_anims,
+    PPB_UL_events,
+    PPB_OT_event_add,
+    PPB_OT_event_delete,
+    PPB_OT_event_browse,
     PPB_PT_panel,
 )
 

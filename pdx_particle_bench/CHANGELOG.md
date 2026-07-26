@@ -8,6 +8,26 @@ is documented as unsupported.
 
 ---
 
+## 0.7.0 - timeline
+
+Play a whole animation's worth of effects at once, each on its own node - not one effect
+looping in isolation.
+
+- **Timeline tab** - a list of events; each fires an `.asset` at a chosen node (a locator empty
+  from the imported mesh) at a start frame. One-shot (fire once, natural length), Continuous
+  (emit Start-End, for `duration=-1` effects) or Repeat (re-fire every N frames Start-End).
+  Scrub the timeline to see the whole sequence play in place on the animated model.
+- **Play timeline** switches the viewport from the single edited effect to the events.
+- Multi-track simulation: each event is its own effect with its own particles, riding its node's
+  animated transform; all are advanced together and drawn per node.
+- Event lints (missing `.asset` / node / file, empty Continuous/Repeat window).
+- **File dialogs remember the last folder** used this session (per category) instead of always
+  reopening at `gfx/particles` - the default is used only until the first pick.
+- Fixed a short-burst emission miss: a subsystem whose emission window is shorter than ~2 sim
+  steps (e.g. a beam pulse, `duration=0.012`) only spawned on some fire phases. Emission is now
+  integrated over each step's overlap with the window, so every firing is reliable (total is
+  still `emission * duration`; long-window effects are unchanged).
+
 ## 0.6.1 - editor polish
 
 - **Templates moved out of code into `.asset` files** (`templates/effects/`, `templates/subsystems/`),
