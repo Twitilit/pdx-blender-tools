@@ -1,0 +1,24 @@
+particle={
+	name="muzzle_flash_effect"
+	subsystem={
+		name="flash"
+		max_amount=6 slave_particles=0 sort="depth" emitter_type="point"
+		invert=no trail=no local_space=yes billboard=yes hide=no
+		texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+		color={ x=255 y=230 z=150 alpha=255,flash_fade }
+		position={ x=0 y=0 z=0 }
+		start=0 duration=0.05
+		emitter_yaw={ 0 10 } emitter_pitch={ 0 10 }
+		velocity={ 1 0.5 }
+		life={ 0.12 0.03 }
+		emission=100
+		size={ 0.6 0.2 }
+		rotation={ 0 360 }
+	}
+	animation={
+		name="flash_fade"
+		start=0 duration=1 repeat=no minValue=0 maxValue=1
+		curve={ 0 1 1 0 }
+		op="MUL" time="life"
+	}
+}

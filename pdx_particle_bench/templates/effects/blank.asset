@@ -1,0 +1,17 @@
+particle={
+	name="new_effect"
+	subsystem={
+		name="main"
+		max_amount=20 slave_particles=0 sort="depth" emitter_type="point"
+		invert=no trail=no local_space=yes billboard=yes hide=no
+		texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+		color={ x=255 y=255 z=255 alpha=200 }
+		position={ x=0 y=0 z=0 }
+		start=0 duration=-1
+		emitter_yaw={ 0 20 } emitter_pitch={ 0 20 }
+		velocity={ 3 1 }
+		life={ 1 0.3 }
+		emission=15
+		size={ 0.5 0.1 }
+	}
+}

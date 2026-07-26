@@ -1,0 +1,32 @@
+particle={
+	name="explosion_effect"
+	subsystem={
+		name="fireball"
+		max_amount=20 slave_particles=0 sort="depth" emitter_type="sphere"
+		invert=no trail=no local_space=no billboard=yes hide=no
+		texture={ file="gfx/particles/flame.dds" x=2 y=2 shader="ParticleAdditive" }
+		color={ x=255 y=180 z=80 alpha=255,boom_fade }
+		position={ x=0 y=0 z=0 }
+		start=0 duration=0.1
+		sphere_emitter_radius={ 0.5 0.3 }
+		sphere_emitter_yaw={ 0 180 }
+		sphere_emitter_pitch={ 0 180 }
+		velocity={ 2 1 }
+		life={ 0.5 0.15 }
+		emission=150
+		size={ 1.5,boom_grow 0.5 }
+		rotation={ 0 360 }
+	}
+	animation={
+		name="boom_fade"
+		start=0 duration=1 repeat=no minValue=0 maxValue=1
+		curve={ 0 1 0.5 1 1 0 }
+		op="MUL" time="life"
+	}
+	animation={
+		name="boom_grow"
+		start=0 duration=1 repeat=no minValue=0 maxValue=3
+		curve={ 0 0.3 1 1 }
+		op="MUL" time="life"
+	}
+}

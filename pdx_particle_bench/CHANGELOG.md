@@ -8,6 +8,21 @@ is documented as unsupported.
 
 ---
 
+## 0.6.1 - editor polish
+
+- **Templates moved out of code into `.asset` files** (`templates/effects/`, `templates/subsystems/`),
+  read on demand - drop a file in the folder and it shows up in the menu, so your own effects can
+  be local templates. Shipped: Blank / Smoke plume / Muzzle flash / Sparks / Explosion / Beam, and
+  subsystem templates Glow / Smoke / Spark / Flash.
+- **Add a subsystem from a template** (the subsystem list's "+" menu), bringing its forces and
+  curves with it (renamed on name collision).
+- **Rename subsystems and animation curves** - the name field is editable in the detail pane;
+  renaming a curve repoints every field that referenced it, and duplicate names are blocked.
+- **Create childsystems** - parent any subsystem to another (the "Parent:" menu in its detail
+  pane) and it emits from the parent's particles instead of the locator. The list shows the tree
+  indented, cycles are blocked, and parent/child links survive add/duplicate/delete. Childsystems
+  now export too, nested inside their parent.
+
 ## 0.6.0 - the editor
 
 The bench becomes an editor: load or create an effect, edit every part live on the real

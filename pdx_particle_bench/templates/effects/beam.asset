@@ -1,0 +1,18 @@
+particle={
+	name="beam_effect"
+	subsystem={
+		name="beam"
+		max_amount=1 slave_particles=0 sort="depth" emitter_type="point"
+		invert=no trail=no local_space=yes billboard=no hide=no
+		texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+		color={ x=150 y=200 z=255 alpha=255 }
+		position={ x=0 y=0 z=0 }
+		start=0 duration=0.1
+		velocity={ 0 0 }
+		life={ 0.2 0 }
+		emission=100
+		size={ 3 0 }
+		particle_yaw={ -90 0 } particle_pitch={ 90 0 }
+		rotation={ 0 0 }
+	}
+}

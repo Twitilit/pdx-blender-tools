@@ -1,0 +1,30 @@
+particle={
+	name="spark_sub"
+	subsystem={
+		name="sparks"
+		max_amount=30 slave_particles=0 sort="depth" emitter_type="point"
+		invert=no trail=no local_space=yes billboard=yes hide=no
+		texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+		color={ x=255 y=200 z=100 alpha=255,spark_fade }
+		position={ x=0 y=0 z=0 }
+		start=0 duration=0.1
+		emitter_yaw={ 0 180 } emitter_pitch={ 45 45 }
+		velocity={ 6 3 }
+		life={ 0.6 0.2 }
+		emission=120
+		size={ 0.12 0.05 }
+		force=spark_gravity
+	}
+	animation={
+		name="spark_fade"
+		start=0 duration=1 repeat=no minValue=0 maxValue=1
+		curve={ 0 1 0.6 1 1 0 }
+		op="MUL" time="life"
+	}
+	force={
+		type="planar"
+		name="spark_gravity"
+		position={ 0 0 0 } direction={ 0 1 0 }
+		local_force=yes yaw=0 division=16 amount=-4
+	}
+}

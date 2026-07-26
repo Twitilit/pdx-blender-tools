@@ -10,7 +10,7 @@
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 6, 0),
+    "version": (0, 6, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > Particle Bench",
     "description": "Preview and edit Clausewitz/HoI4 .asset particle effects on a real locator",
@@ -1560,6 +1560,27 @@ def _on_sub_edit(self, context):
     _tag_redraw()
 
 
+def _on_sub_rename(self, context):
+    if _EDIT_GUARD[0]:
+        return
+    eff = SIM.effect
+    if eff is None or not (0 <= self.idx < len(eff.subs)):
+        return
+    s = eff.subs[self.idx]
+    old, new = s.name, self.name
+    if new == old:
+        return
+    if not new or any(o.name == new for o in eff.subs if o is not s):
+        _EDIT_GUARD[0] = True  # empty or duplicate name: revert the field
+        try:
+            self.name = old
+        finally:
+            _EDIT_GUARD[0] = False
+        return
+    s.name = new
+    _tag_redraw()
+
+
 _FORCE_TYPES = ("planar", "friction", "point", "vortex", "turbulence", "spin")
 
 
@@ -1722,6 +1743,40 @@ def _on_anim_edit(self, context):
     _tag_redraw()
 
 
+def _rename_anim(eff, old, new):
+    """Rekey an animation and repoint every field ref that used it (node stays; keyed by idx)."""
+    eff.anims = {(new if k == old else k): v for k, v in eff.anims.items()}
+    for s in eff.subs:
+        for attr in ("size_ref", "alpha_ref", "rot_ref", "emission_ref", "vel_ref",
+                     "eyaw_ref", "epitch_ref", "pyaw_ref"):
+            if getattr(s, attr, None) == old:
+                setattr(s, attr, new)
+        s.chan = [(b, sp_, (new if r == old else r)) for (b, sp_, r) in s.chan]
+
+
+def _on_anim_rename(self, context):
+    if _EDIT_GUARD[0]:
+        return
+    eff = SIM.effect
+    keys = list(eff.anims) if eff else []
+    if not (0 <= self.idx < len(keys)):
+        return
+    old, new = keys[self.idx], self.name
+    if new == old:
+        return
+    if not new or new in eff.anims:
+        _EDIT_GUARD[0] = True  # invalid/collision: revert the field without recursing
+        try:
+            self.name = old
+        finally:
+            _EDIT_GUARD[0] = False
+        return
+    _rename_anim(eff, old, new)
+    _refresh_curve_links(context.scene.pdx_pb)
+    update_sim(context.scene, force_reset=True)
+    _tag_redraw()
+
+
 def _populate_anim_props(props, effect):
     prev = _EDIT_GUARD[0]
     _EDIT_GUARD[0] = True
@@ -1865,7 +1920,7 @@ def _populate_props(props, effect):
 class PPB_SubsystemProps(bpy.types.PropertyGroup):
     """Editable mirror of one subsystem's fields."""
     idx: bpy.props.IntProperty(default=-1)
-    name: bpy.props.StringProperty()
+    name: bpy.props.StringProperty(update=_on_sub_rename)
 
     emission: bpy.props.FloatProperty(name="Emission", min=0.0, soft_max=200.0, update=_on_sub_edit)
     life_b: bpy.props.FloatProperty(name="Life", min=0.01, soft_max=10.0, update=_on_sub_edit)
@@ -1991,7 +2046,7 @@ class PPB_ForceProps(bpy.types.PropertyGroup):
 class PPB_AnimProps(bpy.types.PropertyGroup):
     """Editable mirror of one animation curve's parameters (the curve itself is a node)."""
     idx: bpy.props.IntProperty(default=-1)
-    name: bpy.props.StringProperty()
+    name: bpy.props.StringProperty(update=_on_anim_rename)
     minv: bpy.props.FloatProperty(name="Min", update=_on_anim_edit)
     maxv: bpy.props.FloatProperty(name="Max", default=1.0, update=_on_anim_edit)
     op: bpy.props.EnumProperty(
@@ -2099,6 +2154,7 @@ class PPB_OT_load(bpy.types.Operator):
     bl_description = "Parse the .asset and restart the simulation"
 
     def execute(self, context):
+        load_constants()  # pick up any constants.json tweaks on (re)load
         props = context.scene.pdx_pb
         path = bpy.path.abspath(props.asset_path)
         if not path or not os.path.isfile(path):
@@ -2119,19 +2175,6 @@ class PPB_OT_load(bpy.types.Operator):
         for msg in effect.lints():
             self.report({"WARNING"}, msg)
         self.report({"INFO"}, "%s: %d subsystems" % (effect.name, len(effect.subs)))
-        return {"FINISHED"}
-
-
-class PPB_OT_reset(bpy.types.Operator):
-    bl_idname = "pdx_pb.reset"
-    bl_label = "Restart"
-    bl_description = "Restart the simulation from frame start"
-
-    def execute(self, context):
-        load_constants()
-        _last_frame[0] = None
-        update_sim(context.scene, force_reset=True)
-        _tag_redraw()
         return {"FINISHED"}
 
 
@@ -2421,7 +2464,13 @@ def _draw_group(col, sp, key):
 def _draw_sub_edit(layout, sp):
     """Detail pane: core fields always, the tail behind '+ Add field'."""
     box = layout.box()
-    box.label(text=sp.name, icon="GREASEPENCIL")
+    box.prop(sp, "name", text="", icon="GREASEPENCIL")
+    _eff = SIM.effect
+    if _eff is not None and 0 <= sp.idx < len(_eff.subs):
+        _s = _eff.subs[sp.idx]
+        _pn = (_eff.subs[_s.parent_idx].name
+               if (_s.parent_idx is not None and 0 <= _s.parent_idx < len(_eff.subs)) else "none")
+        box.menu("PPB_MT_set_parent", text="Parent: " + _pn, icon="LINKED")
     c = box.column(align=True)
     c.prop(sp, "emission")
     _pair(c, sp, "start", "duration")
@@ -2500,7 +2549,6 @@ def _draw_launcher(layout, context):
     col.prop(props, "target", text="Locator")
     row = layout.row(align=True)
     row.operator("pdx_pb.load", icon="FILE_REFRESH")
-    row.operator("pdx_pb.reset", icon="LOOP_BACK")
     row.operator("pdx_pb.reroll", icon="MOD_NOISE")
     layout.prop(props, "enabled")
     if SIM.effect is not None:
@@ -2520,9 +2568,14 @@ class PPB_UL_subsystems(bpy.types.UIList):
             "pdx_pb.mute_sub", text="", emboss=False,
             icon="HIDE_ON" if hidden else "HIDE_OFF", depress=hidden,
         ).index = index
+        depth, p, guard = 0, (s.parent_idx if s else None), 0
+        while p is not None and 0 <= p < len(effect.subs) and guard < 32:
+            depth += 1
+            p = effect.subs[p].parent_idx
+            guard += 1
         body = row.row(align=True)
         body.active = not hidden and (s.enabled if s else True)
-        body.label(text=sp.name)
+        body.label(text=("    " * depth) + sp.name)
         if s is not None:
             if s.hide:
                 body.label(text="hide")
@@ -2547,143 +2600,86 @@ def _new_subsystem(idx, name):
     })
 
 
-def _reindex_subs(eff):
+def _capture_parents(eff):
+    """Snapshot each subsystem's parent as an OBJECT ref (indices shift on insert/delete)."""
+    subs = eff.subs
+    return {
+        id(s): (subs[s.parent_idx]
+                if (s.parent_idx is not None and 0 <= s.parent_idx < len(subs)) else None)
+        for s in subs
+    }
+
+
+def _rebuild_hierarchy(eff, parent_obj):
+    """Renumber subs and rebuild parent_idx/child_idxs from the captured parent objects
+    (a child whose parent is gone becomes top-level)."""
+    pos = {id(s): i for i, s in enumerate(eff.subs)}
     for i, s in enumerate(eff.subs):
         s.idx = i
+        po = parent_obj.get(id(s))
+        s.parent_idx = pos.get(id(po)) if po is not None else None
+        s.child_idxs = []
+    for s in eff.subs:
+        if s.parent_idx is not None:
+            eff.subs[s.parent_idx].child_idxs.append(s.idx)
 
 
-# Best-practice starting points (correct local_space / shader / curves), parsed on use.
-_TEMPLATES = {
-    "Blank": """particle={
-    name="new_effect"
-    subsystem={
-        name="main"
-        max_amount=20 slave_particles=0 sort="depth" emitter_type="point"
-        invert=no trail=no local_space=yes billboard=yes hide=no
-        texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
-        color={ x=255 y=255 z=255 alpha=200 }
-        position={ x=0 y=0 z=0 }
-        start=0 duration=-1
-        emitter_yaw={ 0 20 } emitter_pitch={ 0 20 }
-        velocity={ 3 1 }
-        life={ 1 0.3 }
-        emission=15
-        size={ 0.5 0.1 }
-    }
-}
-""",
-    "Smoke plume": """particle={
-    name="smoke_effect"
-    subsystem={
-        name="smoke"
-        max_amount=25 slave_particles=0 sort="depth" emitter_type="point"
-        invert=no trail=no local_space=yes billboard=yes hide=no
-        texture={ file="gfx/particles/cloud.dds" x=1 y=1 shader="ParticleAlphaBlend" }
-        color={ x=120 y=120 z=120 alpha=60,smoke_fade }
-        position={ x=0 y=0 z=0 }
-        start=0 duration=-1
-        emitter_yaw={ 0 15 } emitter_pitch={ 60 15 }
-        velocity={ 2 0.5 }
-        life={ 1.5 0.4 }
-        emission=12
-        size={ 0.8,smoke_grow 0.3 }
-        rotation={ 0 180 }
-        rotation_speed={ 15 0 }
-        force=smoke_rise
-    }
-    animation={
-        name="smoke_fade"
-        start=0 duration=1 repeat=no minValue=0 maxValue=1
-        curve={ 0 0 0.2 1 0.7 1 1 0 }
-        op="MUL" time="life"
-    }
-    animation={
-        name="smoke_grow"
-        start=0 duration=1 repeat=no minValue=0 maxValue=1
-        curve={ 0 0.5 1 1.5 }
-        op="MUL" time="life"
-    }
-    force={
-        type="planar"
-        name="smoke_rise"
-        position={ 0 0 0 } direction={ 0 1 0 }
-        local_force=yes yaw=0 division=16 amount=1.5
-    }
-}
-""",
-    "Muzzle flash": """particle={
-    name="muzzle_flash_effect"
-    subsystem={
-        name="flash"
-        max_amount=6 slave_particles=0 sort="depth" emitter_type="point"
-        invert=no trail=no local_space=yes billboard=yes hide=no
-        texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
-        color={ x=255 y=230 z=150 alpha=255,flash_fade }
-        position={ x=0 y=0 z=0 }
-        start=0 duration=0.05
-        emitter_yaw={ 0 10 } emitter_pitch={ 0 10 }
-        velocity={ 1 0.5 }
-        life={ 0.12 0.03 }
-        emission=100
-        size={ 0.6 0.2 }
-        rotation={ 0 360 }
-    }
-    animation={
-        name="flash_fade"
-        start=0 duration=1 repeat=no minValue=0 maxValue=1
-        curve={ 0 1 1 0 }
-        op="MUL" time="life"
-    }
-}
-""",
-    "Sparks": """particle={
-    name="sparks_effect"
-    subsystem={
-        name="sparks"
-        max_amount=30 slave_particles=0 sort="depth" emitter_type="point"
-        invert=no trail=no local_space=yes billboard=yes hide=no
-        texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
-        color={ x=255 y=200 z=100 alpha=255,spark_fade }
-        position={ x=0 y=0 z=0 }
-        start=0 duration=0.1
-        emitter_yaw={ 0 180 } emitter_pitch={ 45 45 }
-        velocity={ 6 3 }
-        life={ 0.6 0.2 }
-        emission=120
-        size={ 0.12 0.05 }
-        force=spark_gravity
-    }
-    animation={
-        name="spark_fade"
-        start=0 duration=1 repeat=no minValue=0 maxValue=1
-        curve={ 0 1 0.6 1 1 0 }
-        op="MUL" time="life"
-    }
-    force={
-        type="planar"
-        name="spark_gravity"
-        position={ 0 0 0 } direction={ 0 1 0 }
-        local_force=yes yaw=0 division=16 amount=-4
-    }
-}
-""",
-}
+def _reindex_subs(eff):
+    """Renumber and re-link, preserving the current parent relationships."""
+    _rebuild_hierarchy(eff, _capture_parents(eff))
+
+
+def _is_descendant(eff, sub, other):
+    """Is `other` `sub` itself or one of its descendants? (blocks parent cycles)."""
+    cur, guard = other, 0
+    while cur is not None and guard < 64:
+        if cur is sub:
+            return True
+        p = cur.parent_idx
+        cur = eff.subs[p] if (p is not None and 0 <= p < len(eff.subs)) else None
+        guard += 1
+    return False
+
+
+def _set_parent(eff, child, parent):
+    """Make `child` a childsystem of `parent` (or top-level if parent is None)."""
+    if parent is child or (parent is not None and _is_descendant(eff, child, parent)):
+        return False
+    parent_obj = _capture_parents(eff)
+    parent_obj[id(child)] = parent
+    _rebuild_hierarchy(eff, parent_obj)
+    return True
+
+
+def _templates_dir(sub):
+    return os.path.join(os.path.dirname(__file__), "templates", sub)
+
+
+def _list_templates(sub):
+    """(label, path) for each bundled .asset template in templates/<sub>/, sorted."""
+    d = _templates_dir(sub)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if fn.lower().endswith(".asset"):
+            label = os.path.splitext(fn)[0].replace("_", " ").capitalize()
+            out.append((label, os.path.join(d, fn)))
+    return out
 
 
 class PPB_OT_new(bpy.types.Operator):
     bl_idname = "pdx_pb.new"
     bl_label = "New effect"
     bl_description = "Replace the current effect with a fresh one from a template (unsaved edits are lost)"
-    template: bpy.props.StringProperty(default="Blank")
+    filepath: bpy.props.StringProperty()
 
     def execute(self, context):
-        text = _TEMPLATES.get(self.template)
-        if text is None:
-            return {"CANCELLED"}
         try:
-            eff = Effect(text)
+            with open(self.filepath, "r", encoding="utf-8-sig") as fh:
+                eff = Effect(fh.read())
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
-            self.report({"ERROR"}, "Template parse failed: %s" % exc)
+            self.report({"ERROR"}, "Template load failed: %s" % exc)
             return {"CANCELLED"}
         SIM.effect = eff
         SIM.muted = set()
@@ -2693,7 +2689,7 @@ class PPB_OT_new(bpy.types.Operator):
         _last_frame[0] = None
         update_sim(context.scene, force_reset=True)
         _tag_redraw()
-        self.report({"INFO"}, "New '%s' effect" % self.template)
+        self.report({"INFO"}, "New effect from %s" % os.path.basename(self.filepath))
         return {"FINISHED"}
 
 
@@ -2702,8 +2698,11 @@ class PPB_MT_new(bpy.types.Menu):
     bl_label = "New effect"
 
     def draw(self, context):
-        for name in _TEMPLATES:
-            self.layout.operator("pdx_pb.new", text=name).template = name
+        items = _list_templates("effects")
+        if not items:
+            self.layout.label(text="(no templates found)")
+        for label, path in items:
+            self.layout.operator("pdx_pb.new", text=label).filepath = path
 
 
 class PPB_OT_sub_add(bpy.types.Operator):
@@ -2740,14 +2739,14 @@ class PPB_OT_sub_duplicate(bpy.types.Operator):
         i = props.active_sub
         if eff is None or not (0 <= i < len(eff.subs)):
             return {"CANCELLED"}
+        parent_obj = _capture_parents(eff)
         new = copy.deepcopy(eff.subs[i])
         new.name = new.name + "_copy"
-        new.parent_idx = None
-        new.child_idxs = []
+        parent_obj[id(new)] = parent_obj.get(id(eff.subs[i]))  # sibling of the original
         eff.subs.insert(i + 1, new)
-        _reindex_subs(eff)
+        _rebuild_hierarchy(eff, parent_obj)
         _populate_props(props, eff)
-        props.active_sub = i + 1
+        props.active_sub = new.idx
         update_sim(context.scene, force_reset=True)
         _tag_redraw()
         return {"FINISHED"}
@@ -2764,13 +2763,158 @@ class PPB_OT_sub_delete(bpy.types.Operator):
         i = props.active_sub
         if eff is None or not (0 <= i < len(eff.subs)) or len(eff.subs) <= 1:
             return {"CANCELLED"}
+        parent_obj = _capture_parents(eff)
         del eff.subs[i]
-        _reindex_subs(eff)
+        _rebuild_hierarchy(eff, parent_obj)  # children of the deleted sub orphan to top-level
         _populate_props(props, eff)
         props.active_sub = max(0, min(i, len(eff.subs) - 1))
         update_sim(context.scene, force_reset=True)
         _tag_redraw()
         return {"FINISHED"}
+
+
+class PPB_OT_set_parent(bpy.types.Operator):
+    bl_idname = "pdx_pb.set_parent"
+    bl_label = "Set parent"
+    bl_description = "Make the selected subsystem a childsystem of another (emits from its particles), or top-level"
+    parent_idx: bpy.props.IntProperty(default=-1)  # -1 = top-level
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        i = props.active_sub
+        if eff is None or not (0 <= i < len(eff.subs)):
+            return {"CANCELLED"}
+        child = eff.subs[i]
+        parent = eff.subs[self.parent_idx] if 0 <= self.parent_idx < len(eff.subs) else None
+        if not _set_parent(eff, child, parent):
+            self.report({"WARNING"}, "Can't parent there (would make a cycle)")
+            return {"CANCELLED"}
+        _populate_props(props, eff)
+        props.active_sub = child.idx
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_MT_set_parent(bpy.types.Menu):
+    bl_idname = "PPB_MT_set_parent"
+    bl_label = "Parent"
+
+    def draw(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        self.layout.operator("pdx_pb.set_parent", text="None (top-level)").parent_idx = -1
+        i = props.active_sub
+        if eff is None or not (0 <= i < len(eff.subs)):
+            return
+        child = eff.subs[i]
+        self.layout.separator()
+        any_opt = False
+        for j, s in enumerate(eff.subs):
+            if _is_descendant(eff, child, s):  # skip self and its own descendants (no cycles)
+                continue
+            self.layout.operator("pdx_pb.set_parent", text=s.name).parent_idx = j
+            any_opt = True
+        if not any_opt:
+            self.layout.label(text="(no eligible parent)")
+
+
+def _merge_refs(eff, tmpl, src):
+    """Bring the template subsystem's forces/anims into the effect, renaming on collision."""
+    for i, fn in enumerate(list(src.forces)):
+        f = tmpl.forces.get(fn)
+        if f is None:
+            continue
+        new, k = fn, 1
+        while new in eff.forces:
+            new = "%s_%d" % (fn, k)
+            k += 1
+        nf = copy.deepcopy(f)
+        nf.name = new
+        nf.hash_off = float(sum(ord(c) for c in new) % 97)
+        eff.forces[new] = nf
+        src.forces[i] = new
+    remap = {}
+
+    def _bring(old):
+        if not old:
+            return old
+        if old in remap:
+            return remap[old]
+        a = tmpl.anims.get(old)
+        if a is None:
+            return old
+        new, k = old, 1
+        while new in eff.anims:
+            new = "%s_%d" % (old, k)
+            k += 1
+        eff.anims[new] = dict(a)
+        remap[old] = new
+        return new
+
+    src.size_ref = _bring(src.size_ref)
+    src.alpha_ref = _bring(src.alpha_ref)
+    src.rot_ref = _bring(src.rot_ref)
+    src.emission_ref = _bring(src.emission_ref)
+    src.vel_ref = _bring(src.vel_ref)
+    src.eyaw_ref = _bring(src.eyaw_ref)
+    src.epitch_ref = _bring(src.epitch_ref)
+    src.pyaw_ref = _bring(src.pyaw_ref)
+    src.chan = [(b, sp_, _bring(r)) for (b, sp_, r) in src.chan]
+    src.col_ref = any(c[2] for c in src.chan)
+
+
+class PPB_OT_sub_add_template(bpy.types.Operator):
+    bl_idname = "pdx_pb.sub_add_template"
+    bl_label = "Add subsystem from template"
+    bl_description = "Append a subsystem from a bundled template (its forces/curves come with it)"
+    filepath: bpy.props.StringProperty()
+
+    def execute(self, context):
+        eff = SIM.effect
+        if eff is None:
+            return {"CANCELLED"}
+        try:
+            with open(self.filepath, "r", encoding="utf-8-sig") as fh:
+                tmpl = Effect(fh.read())
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.report({"ERROR"}, "Template load failed: %s" % exc)
+            return {"CANCELLED"}
+        srcs = [s for s in tmpl.subs if s.parent_idx is None]
+        if not srcs:
+            return {"CANCELLED"}
+        src = srcs[0]
+        _merge_refs(eff, tmpl, src)
+        names = {s.name for s in eff.subs}
+        nm, k = src.name, 1
+        while nm in names:
+            nm = "%s_%d" % (src.name, k)
+            k += 1
+        src.name = nm
+        src.parent_idx = None
+        src.child_idxs = []
+        eff.subs.append(src)
+        _reindex_subs(eff)
+        props = context.scene.pdx_pb
+        _populate_props(props, eff)
+        props.active_sub = len(eff.subs) - 1
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_MT_sub_add(bpy.types.Menu):
+    bl_idname = "PPB_MT_sub_add"
+    bl_label = "Add subsystem"
+
+    def draw(self, context):
+        self.layout.operator("pdx_pb.sub_add", text="Minimal", icon="ADD")
+        items = _list_templates("subsystems")
+        if items:
+            self.layout.separator()
+        for label, path in items:
+            self.layout.operator("pdx_pb.sub_add_template", text=label).filepath = path
 
 
 def _draw_subs_tab(layout, context):
@@ -2791,7 +2935,7 @@ def _draw_subs_tab(layout, context):
         "PPB_UL_subsystems", "", props, "subsystems", props, "active_sub", rows=4
     )
     lcol = lrow.column(align=True)
-    lcol.operator("pdx_pb.sub_add", text="", icon="ADD")
+    lcol.menu("PPB_MT_sub_add", text="", icon="ADD")
     lcol.operator("pdx_pb.sub_duplicate", text="", icon="DUPLICATE")
     lcol.operator("pdx_pb.sub_delete", text="", icon="REMOVE")
     idx = props.active_sub
@@ -2888,7 +3032,7 @@ def _fmt_range(base, spread, ref=None):
     return "{ %s %s }" % (_fmt_num(base), _fmt_num(spread))
 
 
-def _serialize_sub(s):
+def _serialize_sub(s, eff):
     out = ["\tsubsystem={"]
     a = out.append
     a('\t\tname="%s"' % s.name)
@@ -2949,6 +3093,11 @@ def _serialize_sub(s):
         a('\t\tmass=%s' % _fmt_num(s.mass))
     if s.forces:
         a('\t\tforce=%s' % ",".join(s.forces))
+    for ci in s.child_idxs:  # nest childsystems inside their parent, indented one level
+        if 0 <= ci < len(eff.subs):
+            child = _serialize_sub(eff.subs[ci], eff)
+            child = child.replace("\tsubsystem={", "\tchildsystem={", 1)
+            a("\n".join("\t" + ln for ln in child.split("\n")))
     a("\t}")
     return "\n".join(out)
 
@@ -2984,8 +3133,8 @@ def _serialize_effect(eff):
     parts = ["particle={", '\tname="%s"' % eff.name, ""]
     for s in eff.subs:
         if s.parent_idx is not None:
-            continue  # childsystem - would need nesting; skipped (see the export warning)
-        parts.append(_serialize_sub(s))
+            continue  # emitted nested inside its parent (see _serialize_sub)
+        parts.append(_serialize_sub(s, eff))
         parts.append("")
     for name, an in eff.anims.items():
         parts.append(_serialize_anim(name, an))
@@ -3028,11 +3177,7 @@ class PPB_OT_export(bpy.types.Operator):
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
             self.report({"ERROR"}, "Write failed: %s" % exc)
             return {"CANCELLED"}
-        n_child = sum(1 for s in eff.subs if s.parent_idx is not None)
-        msg = "Exported %s (comments not preserved)" % os.path.basename(path)
-        if n_child:
-            msg += "; %d childsystem(s) skipped" % n_child
-        self.report({"WARNING"} if n_child else {"INFO"}, msg)
+        self.report({"INFO"}, "Exported %s (comments not preserved)" % os.path.basename(path))
         return {"FINISHED"}
 
 
@@ -3254,7 +3399,7 @@ def _draw_anims_tab(layout, context):
     if 0 <= props.active_anim < len(props.anims):
         ap = props.anims[props.active_anim]
         box = layout.box()
-        box.label(text=ap.name, icon="FCURVE")
+        box.prop(ap, "name", text="Name")
         node = _curve_node(ap.idx)
         if node is not None:
             box.template_curve_mapping(node, "mapping")
@@ -3303,7 +3448,6 @@ CLASSES = (
     PPB_Props,
     PPB_OT_browse,
     PPB_OT_load,
-    PPB_OT_reset,
     PPB_OT_reroll,
     PPB_OT_mute_sub,
     PPB_OT_solo_sub,
@@ -3324,8 +3468,12 @@ CLASSES = (
     PPB_OT_new,
     PPB_MT_new,
     PPB_OT_sub_add,
+    PPB_OT_sub_add_template,
+    PPB_MT_sub_add,
     PPB_OT_sub_duplicate,
     PPB_OT_sub_delete,
+    PPB_OT_set_parent,
+    PPB_MT_set_parent,
     PPB_UL_subsystems,
     PPB_UL_forces,
     PPB_UL_anims,

@@ -1,0 +1,38 @@
+particle={
+	name="smoke_effect"
+	subsystem={
+		name="smoke"
+		max_amount=25 slave_particles=0 sort="depth" emitter_type="point"
+		invert=no trail=no local_space=yes billboard=yes hide=no
+		texture={ file="gfx/particles/cloud.dds" x=1 y=1 shader="ParticleAlphaBlend" }
+		color={ x=120 y=120 z=120 alpha=60,smoke_fade }
+		position={ x=0 y=0 z=0 }
+		start=0 duration=-1
+		emitter_yaw={ 0 15 } emitter_pitch={ 60 15 }
+		velocity={ 2 0.5 }
+		life={ 1.5 0.4 }
+		emission=12
+		size={ 0.8,smoke_grow 0.3 }
+		rotation={ 0 180 }
+		rotation_speed={ 15 0 }
+		force=smoke_rise
+	}
+	animation={
+		name="smoke_fade"
+		start=0 duration=1 repeat=no minValue=0 maxValue=1
+		curve={ 0 0 0.2 1 0.7 1 1 0 }
+		op="MUL" time="life"
+	}
+	animation={
+		name="smoke_grow"
+		start=0 duration=1 repeat=no minValue=0 maxValue=1
+		curve={ 0 0.5 1 1.5 }
+		op="MUL" time="life"
+	}
+	force={
+		type="planar"
+		name="smoke_rise"
+		position={ 0 0 0 } direction={ 0 1 0 }
+		local_force=yes yaw=0 division=16 amount=1.5
+	}
+}
