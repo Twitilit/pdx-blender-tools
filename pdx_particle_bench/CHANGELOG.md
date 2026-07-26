@@ -8,6 +8,29 @@ is documented as unsupported.
 
 ---
 
+## 0.6.0 - the editor
+
+The bench becomes an editor: load or create an effect, edit every part live on the real
+locator, and export a valid `.asset` - the full load/create -> edit -> export loop.
+
+- **Master-detail editor in the N-panel** (its own "Particle Bench" tab). Tabs:
+  Subsystems / Forces / Animations / Settings. Editing any value re-simulates live.
+- **Subsystems** - a scrollable list + a detail pane. Core fields always shown; a "+ Add field"
+  menu reveals the tail (position, rotation, velocity direction, emitter shape, pulse, facing,
+  3D spin, flags). Add / duplicate / delete subsystems.
+- **Texture** - path + Browse (.dds, stored game-relative), additive-vs-alpha, atlas frames.
+- **Forces** - a shared pool: edit type/amount/direction/position/local_force, add/delete,
+  rename (repoints every subsystem), and link/unlink to subsystems.
+- **Animations** - a real draggable curve widget (a hidden node's CurveMapping; vector handles
+  match the game's linear interpolation), plus min/max/op/time/repeat; add/delete; link a curve
+  to a field (size/alpha/colour/rotation/emission/velocity).
+- **New** - start from a template (Blank / Smoke plume / Muzzle flash / Sparks).
+- **Export .asset** - write the edited effect back out (canonical form; hand comments are not
+  preserved; childsystems skipped).
+- **Refire-aware lints** - a sub-frame one-shot that needs Refire to show, and Refire stacking a
+  continuous emitter past its cap.
+- Fixed a colour-flicker bug (per-particle colour was not carried through the draw batch).
+
 ## 0.5.2 - vanilla-coverage features (flipbook, box, forces)
 
 Adds the mechanics a vanilla scan (~480 subsystems across 141 files) found missing, taking the

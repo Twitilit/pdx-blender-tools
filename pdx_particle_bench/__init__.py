@@ -1,5 +1,5 @@
-# PDX Particle Bench - preview a HoI4 .asset particle effect on a real locator
-# inside Blender, to judge it against the mesh it fires from. Behaviour is
+# PDX Particle Bench - preview and edit a HoI4 .asset particle effect on a real
+# locator inside Blender, judging it against the mesh it fires from. Behaviour is
 # measured against the game; the change history is in CHANGELOG.md.
 # Drawing goes through the gpu module (the only way to get true additive blend).
 # Viewport-only: a measuring instrument, not a render path.
@@ -10,13 +10,14 @@
 bl_info = {
     "name": "PDX Particle Bench",
     "author": "pdx-blender-tools contributors",
-    "version": (0, 5, 2),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
-    "location": "View3D > Sidebar (N) > PDX Blender Tools",
-    "description": "Preview Clausewitz/HoI4 .asset particle effects on a real locator",
+    "location": "View3D > Sidebar (N) > Particle Bench",
+    "description": "Preview and edit Clausewitz/HoI4 .asset particle effects on a real locator",
     "category": "3D View",
 }
 
+import copy
 import json
 import math
 import os
@@ -1272,8 +1273,11 @@ def draw_callback():
                     yaw_now + p.osyaw * p.age, p.opitch + p.ospitch * p.age,
                     props.axis_preset, False, False, rot_for_orient,
                 )
+            # pcol MUST ride the tuple: the draw loop below is a separate scope, so
+            # reusing the build-loop's `pcol` painted every quad with the last-built
+            # particle's colour (a per-frame colour flicker on multi-colour effects).
             buckets.setdefault(p.si, []).append(
-                (world_pos, size, alpha, prot, u_life, oaxes)
+                (world_pos, size, alpha, prot, u_life, oaxes, pcol)
             )
 
     if not buckets:
@@ -1305,7 +1309,7 @@ def draw_callback():
         nx, ny = s.atlas
         nframes = nx * ny
         coords, uvs, cols, indices = [], [], [], []
-        for n, (wp, size, alpha, rot, u_life, oaxes) in enumerate(items):
+        for n, (wp, size, alpha, rot, u_life, oaxes, pcol) in enumerate(items):
             half = size * size_gain * 0.5
             au, av = oaxes if oaxes is not None else (ax_u, ax_v)
             ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
@@ -1452,6 +1456,558 @@ class PPB_Prefs(bpy.types.AddonPreferences):
         )
 
 
+# --- Editor: live editing of the loaded effect. Parsed Subsystems/Forces/animations
+# are plain objects, so we mirror them into PropertyGroups; an update callback writes
+# edits back into the live objects and re-sims.
+_EDIT_GUARD = [False]  # True while populating, so field writes don't re-sim
+
+# editable prop name -> Subsystem attribute (plain scalars, synced back on edit)
+_SUB_FIELD_MAP = (
+    ("emission", "emission"),
+    ("start", "start"), ("duration", "duration"), ("max_amount", "max_amount"),
+    ("life_b", "life_b"), ("life_s", "life_s"),
+    ("size_b", "size_b"), ("size_s", "size_s"),
+    ("vel_b", "vel_b"), ("vel_s", "vel_s"),
+    ("eyaw", "eyaw_b"), ("epitch", "epitch_b"),
+    ("rotspd", "rotspd_b"),
+    ("rot_b", "rot_b"), ("rot_s", "rot_s"),
+    ("vyaw_b", "vyaw_b"), ("vyaw_s", "vyaw_s"),
+    ("vpitch_b", "vpitch_b"), ("vpitch_s", "vpitch_s"),
+    ("pyaw_b", "pyaw_b"), ("pyaw_s", "pyaw_s"),
+    ("ppitch_b", "ppitch_b"), ("ppitch_s", "ppitch_s"),
+    ("rsyaw_b", "rsyaw_b"), ("rsyaw_s", "rsyaw_s"),
+    ("rspitch_b", "rspitch_b"), ("rspitch_s", "rspitch_s"),
+    ("rsroll_b", "rsroll_b"), ("rsroll_s", "rsroll_s"),
+    ("mass", "mass"),
+)
+
+# optional tail field groups: key -> menu label (revealed via "+ Add field")
+_SUB_GROUPS = (
+    ("position", "Position offset"),
+    ("rotation", "Rotation angle"),
+    ("veldir", "Velocity direction"),
+    ("emitter", "Emitter shape"),
+    ("pulse", "Pulsed emission"),
+    ("facing", "Facing (billboard=no)"),
+    ("spin3d", "3D facing spin"),
+    ("flags", "Flags (billboard/hide)"),
+)
+
+
+def _recompute_derived(s):
+    """Rebuild the Subsystem fields __init__ computed from editable inputs."""
+    s.pyaw = s.pyaw_b
+    s.ppitch = s.ppitch_b
+    s.orient_per_particle = (not s.billboard) and bool(
+        s.rsyaw_b or s.rsyaw_s or s.rspitch_b or s.rspitch_s
+        or s.pyaw_ref or s.pyaw_s or s.ppitch_s
+    )
+    s.enabled = not (s.hide or s.trail)
+    if s.emitter_type == "sphere" and not s.sphere_r[0] and not s.sphere_r[1]:
+        s.sphere_r = (0.06, 0.0)
+
+
+def _sync_sub_to_effect(sp):
+    if SIM.effect is None or sp.idx < 0 or sp.idx >= len(SIM.effect.subs):
+        return
+    s = SIM.effect.subs[sp.idx]
+    for prop_name, attr in _SUB_FIELD_MAP:
+        setattr(s, attr, getattr(sp, prop_name))
+    s.mass = s.mass or 1.0
+    s.local_space = sp.local_space
+    s.alpha_b = sp.alpha
+    # colour: replace each channel's base, keep its spread/ref
+    col = tuple(sp.color)
+    s.color = col
+    chan_refs = (sp.r_curve or None, sp.g_curve or None, sp.b_curve or None)
+    s.chan = [(col[i], s.chan[i][1], chan_refs[i]) for i in range(3)]
+    s.col_ref = any(chan_refs)
+    # curve links (field -> animation name, or None)
+    s.size_ref = sp.size_curve or None
+    s.alpha_ref = sp.alpha_curve or None
+    s.rot_ref = sp.rot_curve or None
+    s.emission_ref = sp.emission_curve or None
+    s.vel_ref = sp.vel_curve or None
+    # texture
+    s.tex_file = sp.tex_file
+    s.additive = sp.additive
+    s.atlas = (max(1, sp.atlas_x), max(1, sp.atlas_y))
+    # tail groups
+    s.offset = tuple(sp.position)
+    s.emitter_type = sp.emitter_type
+    s.sphere_r = (sp.sph_r_b, sp.sph_r_s)
+    s.sphere_yaw = (sp.sph_yaw_b, sp.sph_yaw_s)
+    s.sphere_pitch = (sp.sph_pitch_b, sp.sph_pitch_s)
+    s.box = ((sp.box_x_b, sp.box_x_s), (sp.box_y_b, sp.box_y_s), (sp.box_z_b, sp.box_z_s))
+    if sp.has_pulse:
+        s.pulse_dur = (sp.pdur_b, sp.pdur_s)
+        s.pulse_sil = (sp.psil_b, sp.psil_s)
+        s.pulsed = True
+        s.pulse_half = False
+    else:
+        s.pulsed = False
+        s.pulse_half = False
+    s.billboard = sp.billboard
+    s.hide = sp.hide
+    _recompute_derived(s)
+
+
+def _on_sub_edit(self, context):
+    if _EDIT_GUARD[0]:
+        return
+    _sync_sub_to_effect(self)
+    update_sim(context.scene, force_reset=True)
+    _tag_redraw()
+
+
+_FORCE_TYPES = ("planar", "friction", "point", "vortex", "turbulence", "spin")
+
+
+def _rename_force(eff, old, new):
+    """Rekey a force in the pool and repoint every subsystem that referenced it."""
+    if old == new or not new or new in eff.forces:
+        return
+    eff.forces = {(new if k == old else k): v for k, v in eff.forces.items()}
+    f = eff.forces.get(new)
+    if f is not None:
+        f.name = new
+        f.hash_off = float(sum(ord(c) for c in new) % 97)
+    for s in eff.subs:
+        s.forces = [new if fn == old else fn for fn in s.forces]
+
+
+def _sync_force_to_effect(fp):
+    eff = SIM.effect
+    if eff is None:
+        return
+    forces = list(eff.forces.values())
+    if not (0 <= fp.idx < len(forces)):
+        return
+    f = forces[fp.idx]
+    if fp.name and fp.name != f.name:
+        _rename_force(eff, f.name, fp.name)
+    f.type = fp.ftype
+    f.amount = fp.amount
+    f.dir_raw = tuple(fp.direction)
+    f.pos_raw = tuple(fp.position)
+    f.local = fp.local_force
+
+
+def _on_force_edit(self, context):
+    if _EDIT_GUARD[0]:
+        return
+    _sync_force_to_effect(self)
+    update_sim(context.scene, force_reset=True)
+    _tag_redraw()
+
+
+def _populate_force_props(props, effect):
+    """Rebuild props.forces from the effect's force pool (guarded, no re-sim)."""
+    prev = _EDIT_GUARD[0]
+    _EDIT_GUARD[0] = True
+    try:
+        props.forces.clear()
+        props.active_force = 0
+        for i, f in enumerate(effect.forces.values()):
+            fp = props.forces.add()
+            fp.idx = i
+            fp.name = f.name
+            fp.ftype = f.type if f.type in _FORCE_TYPES else "planar"
+            fp.amount = f.amount
+            fp.direction = f.dir_raw
+            fp.position = f.pos_raw
+            fp.local_force = f.local
+    finally:
+        _EDIT_GUARD[0] = prev
+
+
+# --- Animations: the curve widget is a real CurveMapping, which an addon can only
+# own via a node. So one hidden node group holds one RGBCurve node per animation;
+# its curve (vector handles = piecewise-linear) mirrors the .asset `pts`. There is no
+# update callback on the curve widget, so a timer polls it and re-syncs on change.
+_CURVE_NG = "_PDX_PB_CURVES"
+_ANIM_OPS = ("MUL", "ADD", "ABS")
+_ANIM_TIMES = ("life", "life_abs", "spawn", "system")
+_curve_sig = [None]
+
+
+def _ensure_curve_ng():
+    ng = bpy.data.node_groups.get(_CURVE_NG)
+    if ng is None:
+        ng = bpy.data.node_groups.new(_CURVE_NG, "ShaderNodeTree")
+    return ng
+
+
+def _curve_node(idx):
+    ng = bpy.data.node_groups.get(_CURVE_NG)
+    return ng.nodes.get("anim_%d" % idx) if ng else None
+
+
+def _set_node_points(node, pts):
+    cm = node.mapping
+    cur = cm.curves[3]
+    xs = [(pts[i * 2], pts[i * 2 + 1]) for i in range(len(pts) // 2)]
+    if len(xs) < 2:
+        xs = [(0.0, 0.0), (1.0, 1.0)]
+    while len(cur.points) > 2:
+        cur.points.remove(cur.points[-1])
+    cur.points[0].location = xs[0]
+    cur.points[1].location = xs[1]
+    for x, y in xs[2:]:
+        cur.points.new(x, y)
+    ys = [y for _x, y in xs]
+    cm.clip_min_x, cm.clip_max_x = 0.0, 1.0
+    cm.clip_min_y = min(0.0, min(ys)) - 0.05
+    cm.clip_max_y = max(1.0, max(ys)) + 0.05
+    for p in cur.points:
+        p.handle_type = "VECTOR"
+    cm.update()
+
+
+def _read_node_points(node):
+    cur = node.mapping.curves[3]
+    pts = []
+    for p in sorted(cur.points, key=lambda pt: pt.location[0]):
+        pts.extend([round(p.location[0], 5), round(p.location[1], 5)])
+    return pts
+
+
+def _populate_anim_curves(effect):
+    ng = _ensure_curve_ng()
+    ng.nodes.clear()
+    for i, a in enumerate(effect.anims.values()):
+        node = ng.nodes.new("ShaderNodeRGBCurve")
+        node.name = "anim_%d" % i
+        node.mapping.use_clip = True
+        _set_node_points(node, a.get("pts") or [0.0, 0.0, 1.0, 1.0])
+
+
+def _sync_anim_curve(idx):
+    eff = SIM.effect
+    node = _curve_node(idx)
+    if eff is None or node is None:
+        return
+    anims = list(eff.anims.values())
+    if 0 <= idx < len(anims):
+        anims[idx]["pts"] = _read_node_points(node)
+
+
+def _sync_all_anim_curves():
+    eff = SIM.effect
+    if eff is not None:
+        for i in range(len(eff.anims)):
+            _sync_anim_curve(i)
+
+
+def _sync_anim_to_effect(ap):
+    eff = SIM.effect
+    if eff is None:
+        return
+    anims = list(eff.anims.values())
+    if not (0 <= ap.idx < len(anims)):
+        return
+    a = anims[ap.idx]
+    a["min"] = ap.minv
+    a["max"] = ap.maxv
+    a["op"] = ap.op
+    a["time"] = ap.atime
+    a["repeat"] = ap.repeat
+
+
+def _on_anim_edit(self, context):
+    if _EDIT_GUARD[0]:
+        return
+    _sync_anim_to_effect(self)
+    update_sim(context.scene, force_reset=True)
+    _tag_redraw()
+
+
+def _populate_anim_props(props, effect):
+    prev = _EDIT_GUARD[0]
+    _EDIT_GUARD[0] = True
+    try:
+        props.anims.clear()
+        props.active_anim = 0
+        for i, (name, a) in enumerate(effect.anims.items()):
+            ap = props.anims.add()
+            ap.idx = i
+            ap.name = name
+            ap.minv = a.get("min", 0.0)
+            ap.maxv = a.get("max", 1.0)
+            ap.op = a.get("op") if a.get("op") in _ANIM_OPS else "MUL"
+            ap.atime = a.get("time") if a.get("time") in _ANIM_TIMES else "life"
+            ap.repeat = bool(a.get("repeat"))
+    finally:
+        _EDIT_GUARD[0] = prev
+
+
+def _refresh_curve_links(props):
+    """Re-read each subsystem's curve refs into its prop_search dropdowns."""
+    eff = SIM.effect
+    if eff is None:
+        return
+    prev = _EDIT_GUARD[0]
+    _EDIT_GUARD[0] = True
+    try:
+        for sp in props.subsystems:
+            if not (0 <= sp.idx < len(eff.subs)):
+                continue
+            s = eff.subs[sp.idx]
+            sp.size_curve = s.size_ref or ""
+            sp.alpha_curve = s.alpha_ref or ""
+            sp.emission_curve = s.emission_ref or ""
+            sp.rot_curve = s.rot_ref or ""
+            sp.vel_curve = s.vel_ref or ""
+            sp.r_curve = s.chan[0][2] or ""
+            sp.g_curve = s.chan[1][2] or ""
+            sp.b_curve = s.chan[2][2] or ""
+    finally:
+        _EDIT_GUARD[0] = prev
+
+
+def _curve_watch():
+    """Timer: the curve widget has no update callback, so poll it and re-sim on change."""
+    try:
+        ng = bpy.data.node_groups.get(_CURVE_NG)
+        if SIM.effect is not None and ng is not None:
+            sig = tuple(
+                (nd.name, tuple((round(p.location[0], 4), round(p.location[1], 4))
+                                for p in nd.mapping.curves[3].points))
+                for nd in ng.nodes
+            )
+            if sig != _curve_sig[0]:
+                _curve_sig[0] = sig
+                _sync_all_anim_curves()
+                # the game interpolates curve points LINEARLY, so snap any smooth (AUTO)
+                # handle a user added to VECTOR - keeps the widget honest to the game
+                for nd in ng.nodes:
+                    cur = nd.mapping.curves[3]
+                    if any(p.handle_type != "VECTOR" for p in cur.points):
+                        for p in cur.points:
+                            p.handle_type = "VECTOR"
+                        nd.mapping.update()
+                sc = bpy.context.scene
+                if sc is not None:
+                    update_sim(sc, force_reset=True)
+                _tag_redraw()
+    except Exception:  # noqa: BLE001 - a background timer must never raise
+        pass
+    return 0.2
+
+
+def _populate_props(props, effect):
+    """Rebuild props.subsystems from a freshly parsed effect (guarded, no re-sim)."""
+    _EDIT_GUARD[0] = True
+    try:
+        props.subsystems.clear()
+        props.active_sub = 0
+        for s in effect.subs:
+            sp = props.subsystems.add()
+            sp.idx = s.idx
+            sp.name = s.name
+            sp.emission = float(s.emission)
+            sp.life_b, sp.life_s = s.life_b, abs(s.life_s)
+            sp.size_b, sp.size_s = s.size_b, abs(s.size_s)
+            sp.vel_b, sp.vel_s = s.vel_b, abs(s.vel_s)
+            sp.color = s.color
+            sp.alpha = s.alpha_b
+            sp.eyaw, sp.epitch = s.eyaw_b, s.epitch_b
+            sp.rotspd = s.rotspd_b
+            sp.mass = s.mass
+            sp.local_space = s.local_space
+            sp.tex_file = s.tex_file
+            sp.additive = s.additive
+            sp.atlas_x, sp.atlas_y = s.atlas
+            # tail fields
+            sp.start = s.start
+            sp.duration = s.duration
+            sp.max_amount = s.max_amount
+            sp.position = s.offset
+            sp.rot_b, sp.rot_s = s.rot_b, abs(s.rot_s)
+            sp.vyaw_b, sp.vyaw_s = s.vyaw_b, abs(s.vyaw_s)
+            sp.vpitch_b, sp.vpitch_s = s.vpitch_b, abs(s.vpitch_s)
+            sp.emitter_type = s.emitter_type
+            sp.sph_r_b, sp.sph_r_s = s.sphere_r
+            sp.sph_yaw_b, sp.sph_yaw_s = s.sphere_yaw
+            sp.sph_pitch_b, sp.sph_pitch_s = s.sphere_pitch
+            sp.box_x_b, sp.box_x_s = s.box[0]
+            sp.box_y_b, sp.box_y_s = s.box[1]
+            sp.box_z_b, sp.box_z_s = s.box[2]
+            sp.pdur_b, sp.pdur_s = s.pulse_dur
+            sp.psil_b, sp.psil_s = s.pulse_sil
+            sp.pyaw_b, sp.pyaw_s = s.pyaw_b, abs(s.pyaw_s)
+            sp.ppitch_b, sp.ppitch_s = s.ppitch_b, abs(s.ppitch_s)
+            sp.rsyaw_b, sp.rsyaw_s = s.rsyaw_b, abs(s.rsyaw_s)
+            sp.rspitch_b, sp.rspitch_s = s.rspitch_b, abs(s.rspitch_s)
+            sp.rsroll_b, sp.rsroll_s = s.rsroll_b, abs(s.rsroll_s)
+            sp.billboard = s.billboard
+            sp.hide = s.hide
+            # auto-show tail groups that are actually authored in this subsystem
+            sp.has_position = any(abs(v) > 1e-9 for v in s.offset)
+            sp.has_rotation = bool(s.rot_b or s.rot_s)
+            sp.has_veldir = bool(s.vyaw_b or s.vyaw_s or s.vpitch_b or s.vpitch_s)
+            sp.has_emitter = s.emitter_type != "point"
+            sp.has_pulse = bool(s.pulsed or s.pulse_half)
+            sp.has_facing = bool(s.pyaw_b or s.pyaw_s or s.ppitch_b or s.ppitch_s)
+            sp.has_spin3d = bool(
+                s.rsyaw_b or s.rsyaw_s or s.rspitch_b or s.rspitch_s or s.rsroll_b or s.rsroll_s
+            )
+            sp.has_flags = (not s.billboard) or s.hide
+        _refresh_curve_links(props)
+        _populate_force_props(props, effect)
+        _populate_anim_curves(effect)
+        _populate_anim_props(props, effect)
+        _curve_sig[0] = None
+    finally:
+        _EDIT_GUARD[0] = False
+
+
+class PPB_SubsystemProps(bpy.types.PropertyGroup):
+    """Editable mirror of one subsystem's fields."""
+    idx: bpy.props.IntProperty(default=-1)
+    name: bpy.props.StringProperty()
+
+    emission: bpy.props.FloatProperty(name="Emission", min=0.0, soft_max=200.0, update=_on_sub_edit)
+    life_b: bpy.props.FloatProperty(name="Life", min=0.01, soft_max=10.0, update=_on_sub_edit)
+    life_s: bpy.props.FloatProperty(name="+/-", min=0.0, soft_max=10.0, update=_on_sub_edit)
+    size_b: bpy.props.FloatProperty(name="Size", min=0.0, soft_max=20.0, update=_on_sub_edit)
+    size_s: bpy.props.FloatProperty(name="+/-", min=0.0, soft_max=20.0, update=_on_sub_edit)
+    vel_b: bpy.props.FloatProperty(name="Velocity", soft_min=-50.0, soft_max=50.0, update=_on_sub_edit)
+    vel_s: bpy.props.FloatProperty(name="+/-", min=0.0, soft_max=50.0, update=_on_sub_edit)
+    color: bpy.props.FloatVectorProperty(
+        name="Color", subtype="COLOR", size=3, min=0.0, max=1.0, update=_on_sub_edit
+    )
+    alpha: bpy.props.FloatProperty(name="Alpha", min=0.0, max=255.0, update=_on_sub_edit)
+    eyaw: bpy.props.FloatProperty(name="Emit yaw", soft_min=-180.0, soft_max=180.0, update=_on_sub_edit)
+    epitch: bpy.props.FloatProperty(name="Emit pitch", soft_min=-180.0, soft_max=180.0, update=_on_sub_edit)
+    rotspd: bpy.props.FloatProperty(name="Rot speed", update=_on_sub_edit)
+    mass: bpy.props.FloatProperty(name="Mass", min=0.0001, soft_max=10.0, update=_on_sub_edit)
+    local_space: bpy.props.BoolProperty(name="local_space", update=_on_sub_edit)
+
+    # texture
+    tex_file: bpy.props.StringProperty(name="Texture", update=_on_sub_edit)
+    additive: bpy.props.BoolProperty(name="Additive blend", update=_on_sub_edit)
+    atlas_x: bpy.props.IntProperty(name="Frames X", min=1, soft_max=8, default=1, update=_on_sub_edit)
+    atlas_y: bpy.props.IntProperty(name="Frames Y", min=1, soft_max=8, default=1, update=_on_sub_edit)
+
+    # curve links (field -> animation name; "" = none)
+    size_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    alpha_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    emission_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    rot_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    vel_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    r_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    g_curve: bpy.props.StringProperty(update=_on_sub_edit)
+    b_curve: bpy.props.StringProperty(update=_on_sub_edit)
+
+    # core timing/cap (always shown)
+    start: bpy.props.FloatProperty(name="Start", min=0.0, soft_max=10.0, update=_on_sub_edit)
+    duration: bpy.props.FloatProperty(
+        name="Duration", soft_min=-1.0, soft_max=10.0, update=_on_sub_edit,
+        description="-1 = continuous, 0 = no particles, >0 = one-shot window (seconds)",
+    )
+    max_amount: bpy.props.IntProperty(name="Max amount", min=0, soft_max=500, update=_on_sub_edit)
+
+    # optional tail groups (revealed via "+ Add field")
+    has_position: bpy.props.BoolProperty(default=False)
+    position: bpy.props.FloatVectorProperty(name="Offset", size=3, subtype="XYZ", update=_on_sub_edit)
+
+    has_rotation: bpy.props.BoolProperty(default=False)
+    rot_b: bpy.props.FloatProperty(name="Angle", update=_on_sub_edit)
+    rot_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+
+    has_veldir: bpy.props.BoolProperty(default=False)
+    vyaw_b: bpy.props.FloatProperty(name="Vel yaw", update=_on_sub_edit)
+    vyaw_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    vpitch_b: bpy.props.FloatProperty(name="Vel pitch", update=_on_sub_edit)
+    vpitch_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+
+    has_emitter: bpy.props.BoolProperty(default=False)
+    emitter_type: bpy.props.EnumProperty(
+        name="Shape", default="point", update=_on_sub_edit,
+        items=[("point", "Point", ""), ("sphere", "Sphere", ""), ("box", "Box", "")],
+    )
+    sph_r_b: bpy.props.FloatProperty(name="Radius", min=0.0, update=_on_sub_edit)
+    sph_r_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    sph_yaw_b: bpy.props.FloatProperty(name="Yaw", update=_on_sub_edit)
+    sph_yaw_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    sph_pitch_b: bpy.props.FloatProperty(name="Pitch", update=_on_sub_edit)
+    sph_pitch_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    box_x_b: bpy.props.FloatProperty(name="X", update=_on_sub_edit)
+    box_x_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    box_y_b: bpy.props.FloatProperty(name="Y", update=_on_sub_edit)
+    box_y_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    box_z_b: bpy.props.FloatProperty(name="Z", update=_on_sub_edit)
+    box_z_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+
+    has_pulse: bpy.props.BoolProperty(default=False)
+    pdur_b: bpy.props.FloatProperty(name="On", min=0.0, update=_on_sub_edit)
+    pdur_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    psil_b: bpy.props.FloatProperty(name="Off", min=0.0, update=_on_sub_edit)
+    psil_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+
+    has_facing: bpy.props.BoolProperty(default=False)
+    pyaw_b: bpy.props.FloatProperty(name="Yaw", update=_on_sub_edit)
+    pyaw_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    ppitch_b: bpy.props.FloatProperty(name="Pitch", update=_on_sub_edit)
+    ppitch_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+
+    has_spin3d: bpy.props.BoolProperty(default=False)
+    rsyaw_b: bpy.props.FloatProperty(name="Yaw/s", update=_on_sub_edit)
+    rsyaw_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    rspitch_b: bpy.props.FloatProperty(name="Pitch/s", update=_on_sub_edit)
+    rspitch_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+    rsroll_b: bpy.props.FloatProperty(name="Roll/s", update=_on_sub_edit)
+    rsroll_s: bpy.props.FloatProperty(name="+/-", min=0.0, update=_on_sub_edit)
+
+    has_flags: bpy.props.BoolProperty(default=False)
+    billboard: bpy.props.BoolProperty(name="billboard", default=True, update=_on_sub_edit)
+    hide: bpy.props.BoolProperty(name="hide", default=False, update=_on_sub_edit)
+
+
+class PPB_ForceProps(bpy.types.PropertyGroup):
+    """Editable mirror of one force in the effect's shared pool."""
+    idx: bpy.props.IntProperty(default=-1)
+    name: bpy.props.StringProperty(name="Name", update=_on_force_edit)
+    ftype: bpy.props.EnumProperty(
+        name="Type", default="planar", update=_on_force_edit,
+        items=[
+            ("planar", "Planar (constant push)", ""),
+            ("friction", "Friction (drag)", ""),
+            ("point", "Point (attract / repel)", ""),
+            ("vortex", "Vortex (radial + swirl)", ""),
+            ("turbulence", "Turbulence (wander)", ""),
+            ("spin", "Spin (orbit)", ""),
+        ],
+    )
+    amount: bpy.props.FloatProperty(name="Amount", update=_on_force_edit)
+    direction: bpy.props.FloatVectorProperty(
+        name="Direction", size=3, subtype="XYZ", default=(0.0, 1.0, 0.0), update=_on_force_edit)
+    position: bpy.props.FloatVectorProperty(
+        name="Position", size=3, subtype="XYZ", update=_on_force_edit)
+    local_force: bpy.props.BoolProperty(name="local_force", default=True, update=_on_force_edit)
+
+
+class PPB_AnimProps(bpy.types.PropertyGroup):
+    """Editable mirror of one animation curve's parameters (the curve itself is a node)."""
+    idx: bpy.props.IntProperty(default=-1)
+    name: bpy.props.StringProperty()
+    minv: bpy.props.FloatProperty(name="Min", update=_on_anim_edit)
+    maxv: bpy.props.FloatProperty(name="Max", default=1.0, update=_on_anim_edit)
+    op: bpy.props.EnumProperty(
+        name="Op", default="MUL", update=_on_anim_edit,
+        items=[("MUL", "Multiply", ""), ("ADD", "Add", ""), ("ABS", "Replace", "")])
+    atime: bpy.props.EnumProperty(
+        name="Time", default="life", update=_on_anim_edit,
+        items=[
+            ("life", "Life (age fraction)", ""),
+            ("life_abs", "Life (seconds)", ""),
+            ("spawn", "Spawn (emitter timeline)", ""),
+            ("system", "System (global clock)", ""),
+        ])
+    repeat: bpy.props.BoolProperty(name="Repeat", update=_on_anim_edit)
+
+
 class PPB_Props(bpy.types.PropertyGroup):
     asset_path: bpy.props.StringProperty(
         name="Asset", description="HoI4 particle .asset file (use Browse, or paste a path)"
@@ -1462,6 +2018,22 @@ class PPB_Props(bpy.types.PropertyGroup):
         type=bpy.types.Object,
     )
     enabled: bpy.props.BoolProperty(name="Show", default=True)
+    subsystems: bpy.props.CollectionProperty(type=PPB_SubsystemProps)
+    active_sub: bpy.props.IntProperty(name="Active subsystem", default=0)
+    forces: bpy.props.CollectionProperty(type=PPB_ForceProps)
+    active_force: bpy.props.IntProperty(name="Active force", default=0)
+    anims: bpy.props.CollectionProperty(type=PPB_AnimProps)
+    active_anim: bpy.props.IntProperty(name="Active animation", default=0)
+    panel_tab: bpy.props.EnumProperty(
+        name="Tab",
+        items=[
+            ("SUBS", "Subsystems", "Edit the effect's subsystems"),
+            ("FORCES", "Forces", "Edit the shared force pool"),
+            ("ANIMS", "Animations", "Edit the animation curves"),
+            ("SETTINGS", "Settings", "Preview axes, refire and display"),
+        ],
+        default="SUBS",
+    )
 
     axis_preset: bpy.props.EnumProperty(
         name="Axes",
@@ -1540,6 +2112,7 @@ class PPB_OT_load(bpy.types.Operator):
             return {"CANCELLED"}
         SIM.effect = effect
         SIM.muted = set()
+        _populate_props(props, effect)
         _last_frame[0] = None
         update_sim(context.scene, force_reset=True)
         _tag_redraw()
@@ -1727,102 +2300,1006 @@ class PPB_OT_roundtrip(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _refire_lints(effect, refire, frame_dt):
+    """Warnings that depend on the Refire knob, so they live here (shown live in the
+    panel) rather than in the effect-intrinsic Effect.lints()."""
+    out = []
+    subframe = any(s.enabled and 0.0 < s.duration < frame_dt for s in effect.subs)
+    continuous = any(s.enabled and s.duration < 0.0 for s in effect.subs)
+    if refire <= 0 and subframe:
+        out.append((
+            "Sub-frame one-shot (duration < 1 frame) shows nothing at Refire 0 - set "
+            "Refire >= 1, or park the playhead on the firing frame", "INFO"))
+    if refire > 0 and continuous:
+        out.append((
+            "Refire stacks continuous emitters (duration=-1): live count runs past "
+            "max_amount. Use Refire=0 for a continuous effect", "ERROR"))
+    return out
+
+
+def _draw_lint(layout, context, text, icon="ERROR", alert=True):
+    """Draw a lint wrapped to the panel width (Blender labels do not wrap), red when alert."""
+    import textwrap
+    width = context.region.width if context.region else 300
+    chars = max(18, int(width / 7.0) - 6)
+    col = layout.column(align=True)
+    col.alert = alert
+    for i, line in enumerate(textwrap.wrap(text, width=chars)):
+        col.label(text=line, icon=(icon if i == 0 else "BLANK1"))
+
+
+class PPB_OT_add_field(bpy.types.Operator):
+    bl_idname = "pdx_pb.add_field"
+    bl_label = "Add field"
+    bl_description = "Show this field group for the selected subsystem"
+    group: bpy.props.StringProperty()
+
+    def execute(self, context):
+        _toggle_field(context, self.group, True)
+        return {"FINISHED"}
+
+
+class PPB_OT_remove_field(bpy.types.Operator):
+    bl_idname = "pdx_pb.remove_field"
+    bl_label = "Remove field"
+    bl_description = "Hide this field group (its value is kept)"
+    group: bpy.props.StringProperty()
+
+    def execute(self, context):
+        _toggle_field(context, self.group, False)
+        return {"FINISHED"}
+
+
+def _toggle_field(context, group, on):
+    props = context.scene.pdx_pb
+    if not (0 <= props.active_sub < len(props.subsystems)):
+        return
+    sp = props.subsystems[props.active_sub]
+    setattr(sp, "has_" + group, on)
+    # re-sync: adding/removing pulse changes emission behaviour, so re-sim
+    _sync_sub_to_effect(sp)
+    update_sim(context.scene, force_reset=True)
+    _tag_redraw()
+
+
+class PPB_MT_add_field(bpy.types.Menu):
+    bl_idname = "PPB_MT_add_field"
+    bl_label = "Add field"
+
+    def draw(self, context):
+        props = context.scene.pdx_pb
+        sp = (props.subsystems[props.active_sub]
+              if 0 <= props.active_sub < len(props.subsystems) else None)
+        left = False
+        for key, label in _SUB_GROUPS:
+            if sp is not None and not getattr(sp, "has_" + key):
+                self.layout.operator("pdx_pb.add_field", text=label).group = key
+                left = True
+        if not left:
+            self.layout.label(text="All fields shown")
+
+
+def _pair(col, sp, a, b):
+    row = col.row(align=True)
+    row.prop(sp, a)
+    row.prop(sp, b)
+
+
+def _draw_group(col, sp, key):
+    if key == "position":
+        col.prop(sp, "position")
+    elif key == "rotation":
+        _pair(col, sp, "rot_b", "rot_s")
+    elif key == "veldir":
+        _pair(col, sp, "vyaw_b", "vyaw_s")
+        _pair(col, sp, "vpitch_b", "vpitch_s")
+    elif key == "emitter":
+        col.prop(sp, "emitter_type")
+        if sp.emitter_type == "sphere":
+            _pair(col, sp, "sph_r_b", "sph_r_s")
+            _pair(col, sp, "sph_yaw_b", "sph_yaw_s")
+            _pair(col, sp, "sph_pitch_b", "sph_pitch_s")
+        elif sp.emitter_type == "box":
+            _pair(col, sp, "box_x_b", "box_x_s")
+            _pair(col, sp, "box_y_b", "box_y_s")
+            _pair(col, sp, "box_z_b", "box_z_s")
+    elif key == "pulse":
+        _pair(col, sp, "pdur_b", "pdur_s")
+        _pair(col, sp, "psil_b", "psil_s")
+    elif key == "facing":
+        _pair(col, sp, "pyaw_b", "pyaw_s")
+        _pair(col, sp, "ppitch_b", "ppitch_s")
+    elif key == "spin3d":
+        _pair(col, sp, "rsyaw_b", "rsyaw_s")
+        _pair(col, sp, "rspitch_b", "rspitch_s")
+        _pair(col, sp, "rsroll_b", "rsroll_s")
+    elif key == "flags":
+        col.prop(sp, "billboard")
+        col.prop(sp, "hide")
+
+
+def _draw_sub_edit(layout, sp):
+    """Detail pane: core fields always, the tail behind '+ Add field'."""
+    box = layout.box()
+    box.label(text=sp.name, icon="GREASEPENCIL")
+    c = box.column(align=True)
+    c.prop(sp, "emission")
+    _pair(c, sp, "start", "duration")
+    c.prop(sp, "max_amount")
+    _pair(c, sp, "life_b", "life_s")
+    _pair(c, sp, "size_b", "size_s")
+    _pair(c, sp, "vel_b", "vel_s")
+    row = c.row(align=True)
+    row.prop(sp, "color", text="")
+    row.prop(sp, "alpha")
+    _pair(c, sp, "eyaw", "epitch")
+    c.prop(sp, "rotspd")
+    c.prop(sp, "mass")
+    c.prop(sp, "local_space")
+
+    tb = box.box()
+    tb.label(text="Texture", icon="TEXTURE")
+    row = tb.row(align=True)
+    row.prop(sp, "tex_file", text="")
+    row.operator("pdx_pb.browse_texture", text="", icon="FILEBROWSER")
+    tb.prop(sp, "additive")
+    row = tb.row(align=True)
+    row.prop(sp, "atlas_x")
+    row.prop(sp, "atlas_y")
+
+    props = bpy.context.scene.pdx_pb
+    if props.anims:
+        cb = box.box()
+        cb.label(text="Curves", icon="FCURVE")
+        cb.prop_search(sp, "size_curve", props, "anims", text="Size")
+        cb.prop_search(sp, "alpha_curve", props, "anims", text="Alpha")
+        cb.prop_search(sp, "emission_curve", props, "anims", text="Emission")
+        cb.prop_search(sp, "rot_curve", props, "anims", text="Rotation")
+        cb.prop_search(sp, "vel_curve", props, "anims", text="Velocity")
+        row = cb.row(align=True)
+        row.prop_search(sp, "r_curve", props, "anims", text="R")
+        row.prop_search(sp, "g_curve", props, "anims", text="G")
+        row.prop_search(sp, "b_curve", props, "anims", text="B")
+
+    for key, label in _SUB_GROUPS:
+        if getattr(sp, "has_" + key):
+            gb = box.box()
+            hdr = gb.row(align=True)
+            hdr.label(text=label)
+            hdr.operator("pdx_pb.remove_field", text="", icon="X", emboss=False).group = key
+            _draw_group(gb.column(align=True), sp, key)
+
+    eff = SIM.effect
+    if eff is not None and 0 <= sp.idx < len(eff.subs):
+        s = eff.subs[sp.idx]
+        fb = box.box()
+        fb.label(text="Forces", icon="FORCE_FORCE")
+        for fn in s.forces:
+            r = fb.row(align=True)
+            r.label(text=fn)
+            r.operator("pdx_pb.unlink_force", text="", icon="X", emboss=False).force_name = fn
+        fb.menu("PPB_MT_link_force", text="Link force", icon="ADD")
+
+    box.menu("PPB_MT_add_field", text="Add field", icon="ADD")
+
+
+def _draw_launcher(layout, context):
+    """Quick load/preview controls at the top of the panel."""
+    props = context.scene.pdx_pb
+    prefs = get_prefs()
+    if not prefs or not (prefs.mod_root or prefs.vanilla_root):
+        layout.label(text="Set mod/vanilla roots in Add-on Preferences", icon="ERROR")
+
+    row = layout.row(align=True)
+    row.menu("PPB_MT_new", text="New", icon="FILE_NEW")
+    row.operator("pdx_pb.roundtrip", icon="IMPORT")
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(props, "asset_path", text="")
+    row.operator("pdx_pb.browse", text="", icon="FILEBROWSER")
+    col.prop(props, "target", text="Locator")
+    row = layout.row(align=True)
+    row.operator("pdx_pb.load", icon="FILE_REFRESH")
+    row.operator("pdx_pb.reset", icon="LOOP_BACK")
+    row.operator("pdx_pb.reroll", icon="MOD_NOISE")
+    layout.prop(props, "enabled")
+    if SIM.effect is not None:
+        layout.operator("pdx_pb.export", icon="EXPORT")
+
+
+class PPB_UL_subsystems(bpy.types.UIList):
+    """The subsystem list - one row each, with the mute toggle and live/max state."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        sp = item
+        effect = SIM.effect
+        s = effect.subs[index] if (effect and index < len(effect.subs)) else None
+        hidden = index in SIM.muted
+        row = layout.row(align=True)
+        row.operator(
+            "pdx_pb.mute_sub", text="", emboss=False,
+            icon="HIDE_ON" if hidden else "HIDE_OFF", depress=hidden,
+        ).index = index
+        body = row.row(align=True)
+        body.active = not hidden and (s.enabled if s else True)
+        body.label(text=sp.name)
+        if s is not None:
+            if s.hide:
+                body.label(text="hide")
+            elif s.trail:
+                body.label(text="trail")
+            else:
+                body.label(text="%d/%d" % (s.live, s.max_amount))
+            body.label(text="ADD" if s.additive else "ALPHA")
+
+
+def _new_subsystem(idx, name):
+    """A minimal subsystem that actually renders (additive glow, point emitter)."""
+    return Subsystem(idx, {
+        "name": name, "max_amount": 20, "emitter_type": "point",
+        "local_space": "yes", "billboard": "yes",
+        "texture": {"file": "gfx/particles/glow.dds", "x": 1, "y": 1, "shader": "ParticleAdditive"},
+        "color": {"x": 255, "y": 255, "z": 255, "alpha": 200},
+        "position": {"x": 0, "y": 0, "z": 0},
+        "start": 0, "duration": -1,
+        "emitter_yaw": [0, 20], "emitter_pitch": [0, 20],
+        "velocity": [3, 1], "life": [1, 0.3], "emission": 15, "size": [0.5, 0.1],
+    })
+
+
+def _reindex_subs(eff):
+    for i, s in enumerate(eff.subs):
+        s.idx = i
+
+
+# Best-practice starting points (correct local_space / shader / curves), parsed on use.
+_TEMPLATES = {
+    "Blank": """particle={
+    name="new_effect"
+    subsystem={
+        name="main"
+        max_amount=20 slave_particles=0 sort="depth" emitter_type="point"
+        invert=no trail=no local_space=yes billboard=yes hide=no
+        texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+        color={ x=255 y=255 z=255 alpha=200 }
+        position={ x=0 y=0 z=0 }
+        start=0 duration=-1
+        emitter_yaw={ 0 20 } emitter_pitch={ 0 20 }
+        velocity={ 3 1 }
+        life={ 1 0.3 }
+        emission=15
+        size={ 0.5 0.1 }
+    }
+}
+""",
+    "Smoke plume": """particle={
+    name="smoke_effect"
+    subsystem={
+        name="smoke"
+        max_amount=25 slave_particles=0 sort="depth" emitter_type="point"
+        invert=no trail=no local_space=yes billboard=yes hide=no
+        texture={ file="gfx/particles/cloud.dds" x=1 y=1 shader="ParticleAlphaBlend" }
+        color={ x=120 y=120 z=120 alpha=60,smoke_fade }
+        position={ x=0 y=0 z=0 }
+        start=0 duration=-1
+        emitter_yaw={ 0 15 } emitter_pitch={ 60 15 }
+        velocity={ 2 0.5 }
+        life={ 1.5 0.4 }
+        emission=12
+        size={ 0.8,smoke_grow 0.3 }
+        rotation={ 0 180 }
+        rotation_speed={ 15 0 }
+        force=smoke_rise
+    }
+    animation={
+        name="smoke_fade"
+        start=0 duration=1 repeat=no minValue=0 maxValue=1
+        curve={ 0 0 0.2 1 0.7 1 1 0 }
+        op="MUL" time="life"
+    }
+    animation={
+        name="smoke_grow"
+        start=0 duration=1 repeat=no minValue=0 maxValue=1
+        curve={ 0 0.5 1 1.5 }
+        op="MUL" time="life"
+    }
+    force={
+        type="planar"
+        name="smoke_rise"
+        position={ 0 0 0 } direction={ 0 1 0 }
+        local_force=yes yaw=0 division=16 amount=1.5
+    }
+}
+""",
+    "Muzzle flash": """particle={
+    name="muzzle_flash_effect"
+    subsystem={
+        name="flash"
+        max_amount=6 slave_particles=0 sort="depth" emitter_type="point"
+        invert=no trail=no local_space=yes billboard=yes hide=no
+        texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+        color={ x=255 y=230 z=150 alpha=255,flash_fade }
+        position={ x=0 y=0 z=0 }
+        start=0 duration=0.05
+        emitter_yaw={ 0 10 } emitter_pitch={ 0 10 }
+        velocity={ 1 0.5 }
+        life={ 0.12 0.03 }
+        emission=100
+        size={ 0.6 0.2 }
+        rotation={ 0 360 }
+    }
+    animation={
+        name="flash_fade"
+        start=0 duration=1 repeat=no minValue=0 maxValue=1
+        curve={ 0 1 1 0 }
+        op="MUL" time="life"
+    }
+}
+""",
+    "Sparks": """particle={
+    name="sparks_effect"
+    subsystem={
+        name="sparks"
+        max_amount=30 slave_particles=0 sort="depth" emitter_type="point"
+        invert=no trail=no local_space=yes billboard=yes hide=no
+        texture={ file="gfx/particles/glow.dds" x=1 y=1 shader="ParticleAdditive" }
+        color={ x=255 y=200 z=100 alpha=255,spark_fade }
+        position={ x=0 y=0 z=0 }
+        start=0 duration=0.1
+        emitter_yaw={ 0 180 } emitter_pitch={ 45 45 }
+        velocity={ 6 3 }
+        life={ 0.6 0.2 }
+        emission=120
+        size={ 0.12 0.05 }
+        force=spark_gravity
+    }
+    animation={
+        name="spark_fade"
+        start=0 duration=1 repeat=no minValue=0 maxValue=1
+        curve={ 0 1 0.6 1 1 0 }
+        op="MUL" time="life"
+    }
+    force={
+        type="planar"
+        name="spark_gravity"
+        position={ 0 0 0 } direction={ 0 1 0 }
+        local_force=yes yaw=0 division=16 amount=-4
+    }
+}
+""",
+}
+
+
+class PPB_OT_new(bpy.types.Operator):
+    bl_idname = "pdx_pb.new"
+    bl_label = "New effect"
+    bl_description = "Replace the current effect with a fresh one from a template (unsaved edits are lost)"
+    template: bpy.props.StringProperty(default="Blank")
+
+    def execute(self, context):
+        text = _TEMPLATES.get(self.template)
+        if text is None:
+            return {"CANCELLED"}
+        try:
+            eff = Effect(text)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.report({"ERROR"}, "Template parse failed: %s" % exc)
+            return {"CANCELLED"}
+        SIM.effect = eff
+        SIM.muted = set()
+        props = context.scene.pdx_pb
+        _populate_props(props, eff)
+        props.asset_path = ""
+        _last_frame[0] = None
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        self.report({"INFO"}, "New '%s' effect" % self.template)
+        return {"FINISHED"}
+
+
+class PPB_MT_new(bpy.types.Menu):
+    bl_idname = "PPB_MT_new"
+    bl_label = "New effect"
+
+    def draw(self, context):
+        for name in _TEMPLATES:
+            self.layout.operator("pdx_pb.new", text=name).template = name
+
+
+class PPB_OT_sub_add(bpy.types.Operator):
+    bl_idname = "pdx_pb.sub_add"
+    bl_label = "Add subsystem"
+    bl_description = "Add a new minimal subsystem to the effect"
+
+    def execute(self, context):
+        eff = SIM.effect
+        if eff is None:
+            return {"CANCELLED"}
+        names = {s.name for s in eff.subs}
+        n = 1
+        while ("sub_%d" % n) in names:
+            n += 1
+        eff.subs.append(_new_subsystem(len(eff.subs), "sub_%d" % n))
+        _reindex_subs(eff)
+        props = context.scene.pdx_pb
+        _populate_props(props, eff)
+        props.active_sub = len(eff.subs) - 1
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_sub_duplicate(bpy.types.Operator):
+    bl_idname = "pdx_pb.sub_duplicate"
+    bl_label = "Duplicate subsystem"
+    bl_description = "Copy the selected subsystem"
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        i = props.active_sub
+        if eff is None or not (0 <= i < len(eff.subs)):
+            return {"CANCELLED"}
+        new = copy.deepcopy(eff.subs[i])
+        new.name = new.name + "_copy"
+        new.parent_idx = None
+        new.child_idxs = []
+        eff.subs.insert(i + 1, new)
+        _reindex_subs(eff)
+        _populate_props(props, eff)
+        props.active_sub = i + 1
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_sub_delete(bpy.types.Operator):
+    bl_idname = "pdx_pb.sub_delete"
+    bl_label = "Delete subsystem"
+    bl_description = "Remove the selected subsystem (an effect keeps at least one)"
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        i = props.active_sub
+        if eff is None or not (0 <= i < len(eff.subs)) or len(eff.subs) <= 1:
+            return {"CANCELLED"}
+        del eff.subs[i]
+        _reindex_subs(eff)
+        _populate_props(props, eff)
+        props.active_sub = max(0, min(i, len(eff.subs) - 1))
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+def _draw_subs_tab(layout, context):
+    """Master-detail: the subsystem list on top, the selected one's fields below."""
+    props = context.scene.pdx_pb
+    effect = SIM.effect
+
+    row = layout.row(align=True)
+    row.label(text=effect.name, icon="PARTICLES")
+    if SIM.muted:
+        row.operator("pdx_pb.show_all_subs", text="", icon="HIDE_OFF")
+
+    if len(props.subsystems) != len(effect.subs):
+        layout.label(text="Re-load the effect to edit its values", icon="INFO")
+        return
+    lrow = layout.row()
+    lrow.template_list(
+        "PPB_UL_subsystems", "", props, "subsystems", props, "active_sub", rows=4
+    )
+    lcol = lrow.column(align=True)
+    lcol.operator("pdx_pb.sub_add", text="", icon="ADD")
+    lcol.operator("pdx_pb.sub_duplicate", text="", icon="DUPLICATE")
+    lcol.operator("pdx_pb.sub_delete", text="", icon="REMOVE")
+    idx = props.active_sub
+    if 0 <= idx < len(effect.subs):
+        row = layout.row(align=True)
+        row.operator("pdx_pb.solo_sub", text="Solo", icon="RADIOBUT_ON").index = idx
+        row.operator("pdx_pb.show_all_subs", text="Show All", icon="HIDE_OFF")
+        _draw_sub_edit(layout, props.subsystems[idx])
+
+    for msg in effect.lints():
+        _draw_lint(layout, context, msg, icon="ERROR", alert=True)
+    fps = context.scene.render.fps / max(context.scene.render.fps_base, 1e-6)
+    for msg, icon in _refire_lints(effect, props.refire_frames, 1.0 / max(fps, 1e-6)):
+        _draw_lint(layout, context, msg, icon=icon, alert=(icon == "ERROR"))
+
+
+def _draw_settings_tab(layout, context):
+    props = context.scene.pdx_pb
+    if context.scene.view_settings.view_transform != "Standard":
+        layout.label(text="Colour tone-mapped by view transform", icon="INFO")
+        layout.label(text="Set Color Management > Standard to compare")
+
+    box = layout.box()
+    box.prop(props, "axis_preset")
+    box.prop(props, "refire_frames")
+
+    box = layout.box()
+    box.label(text="Display (preview only, not simulated)")
+    box.prop(props, "bg_luminance", slider=True)
+    note = box.column(align=True)
+    note.scale_y = 0.72
+    note.label(text="Approximation, not an exact game match", icon="INFO")
+    note.label(text="(different, older engine + render pipeline).")
+
+    layout.separator()
+    row = layout.row()
+    row.alignment = "RIGHT"
+    row.label(text="v{}.{}.{}".format(*bl_info["version"]))
+
+
+def _to_game_relative(path):
+    """Absolute .dds path -> game-relative (mod/vanilla root stripped, forward slashes)."""
+    path = os.path.normpath(bpy.path.abspath(path))
+    prefs = get_prefs()
+    for root in ((prefs.mod_root, prefs.vanilla_root) if prefs else ()):
+        if not root:
+            continue
+        try:
+            rel = os.path.relpath(path, os.path.normpath(bpy.path.abspath(root)))
+        except ValueError:
+            continue
+        if not rel.startswith(".."):
+            return rel.replace("\\", "/")
+    return path.replace("\\", "/")
+
+
+class PPB_OT_browse_texture(bpy.types.Operator):
+    bl_idname = "pdx_pb.browse_texture"
+    bl_label = "Browse texture"
+    bl_description = "Pick a .dds for the selected subsystem (stored game-relative)"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.dds", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        prefs = get_prefs()
+        base = (prefs.vanilla_root if prefs and prefs.browse_vanilla else
+                (prefs.mod_root if prefs else ""))
+        if base:
+            start = os.path.join(bpy.path.abspath(base), "gfx", "particles")
+            if os.path.isdir(start):
+                self.filepath = start + os.sep
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        props = context.scene.pdx_pb
+        if 0 <= props.active_sub < len(props.subsystems):
+            props.subsystems[props.active_sub].tex_file = _to_game_relative(self.filepath)
+        return {"FINISHED"}
+
+
+# --- .asset serializer: write the edited effect back out as a valid particle block.
+# Canonical form (not byte-identical to the source); hand comments are not preserved.
+def _fmt_num(x):
+    x = float(x)
+    if abs(x - round(x)) < 1e-6:
+        return str(int(round(x)))
+    return ("%.5f" % x).rstrip("0").rstrip(".")
+
+
+def _fmt_range(base, spread, ref=None):
+    if ref:
+        return "{ %s,%s %s }" % (_fmt_num(base), ref, _fmt_num(spread))
+    return "{ %s %s }" % (_fmt_num(base), _fmt_num(spread))
+
+
+def _serialize_sub(s):
+    out = ["\tsubsystem={"]
+    a = out.append
+    a('\t\tname="%s"' % s.name)
+    a('\t\tmax_amount=%d slave_particles=0 sort="depth" emitter_type="%s"' % (s.max_amount, s.emitter_type))
+    a('\t\tinvert=no trail=%s local_space=%s billboard=%s hide=%s' % (
+        "yes" if s.trail else "no", "yes" if s.local_space else "no",
+        "yes" if s.billboard else "no", "yes" if s.hide else "no"))
+    shader = "ParticleAdditive" if s.additive else "ParticleAlphaBlend"
+    a('\t\ttexture={ file="%s" x=%d y=%d shader="%s" }' % (s.tex_file, s.atlas[0], s.atlas[1], shader))
+    chans = []
+    for i, key in enumerate("xyz"):
+        b, sp_, ref = s.chan[i]
+        b255, s255 = round(b * 255.0), round(sp_ * 255.0)
+        if ref:
+            chans.append("%s={ %d,%s %d }" % (key, b255, ref, s255))
+        elif s255:
+            chans.append("%s={ %d %d }" % (key, b255, s255))
+        else:
+            chans.append("%s=%d" % (key, b255))
+    chans.append("alpha=%s%s" % (_fmt_num(s.alpha_b), ("," + s.alpha_ref) if s.alpha_ref else ""))
+    a('\t\tcolor={ %s }' % " ".join(chans))
+    a('\t\tposition={ x=%s y=%s z=%s }' % (
+        _fmt_num(s.offset[0]), _fmt_num(s.offset[1]), _fmt_num(s.offset[2])))
+    a('\t\tstart=%s duration=%s' % (_fmt_num(s.start), _fmt_num(s.duration)))
+    a('\t\temitter_yaw=%s emitter_pitch=%s' % (
+        _fmt_range(s.eyaw_b, s.eyaw_s, s.eyaw_ref), _fmt_range(s.epitch_b, s.epitch_s, s.epitch_ref)))
+    a('\t\tvelocity_yaw=%s velocity_pitch=%s' % (
+        _fmt_range(s.vyaw_b, s.vyaw_s), _fmt_range(s.vpitch_b, s.vpitch_s)))
+    a('\t\tvelocity=%s' % _fmt_range(s.vel_b, s.vel_s, s.vel_ref))
+    a('\t\tlife=%s' % _fmt_range(s.life_b, s.life_s))
+    a('\t\temission=%s%s' % (_fmt_num(s.emission), ("," + s.emission_ref) if s.emission_ref else ""))
+    a('\t\tsize=%s' % _fmt_range(s.size_b, s.size_s, s.size_ref))
+    a('\t\trotation=%s' % _fmt_range(s.rot_b, s.rot_s, s.rot_ref))
+    if s.rotspd_b or s.rotspd_s:
+        a('\t\trotation_speed=%s' % _fmt_range(s.rotspd_b, s.rotspd_s))
+    if s.rsyaw_b or s.rsyaw_s:
+        a('\t\trotation_speed_yaw=%s' % _fmt_range(s.rsyaw_b, s.rsyaw_s))
+    if s.rspitch_b or s.rspitch_s:
+        a('\t\trotation_speed_pitch=%s' % _fmt_range(s.rspitch_b, s.rspitch_s))
+    if s.rsroll_b or s.rsroll_s:
+        a('\t\trotation_speed_roll=%s' % _fmt_range(s.rsroll_b, s.rsroll_s))
+    if s.pyaw_b or s.pyaw_s or s.pyaw_ref:
+        a('\t\tparticle_yaw=%s' % _fmt_range(s.pyaw_b, s.pyaw_s, s.pyaw_ref))
+    if s.ppitch_b or s.ppitch_s:
+        a('\t\tparticle_pitch=%s' % _fmt_range(s.ppitch_b, s.ppitch_s))
+    if s.emitter_type == "sphere":
+        a('\t\tsphere_emitter_radius=%s' % _fmt_range(*s.sphere_r))
+        a('\t\tsphere_emitter_yaw=%s' % _fmt_range(*s.sphere_yaw))
+        a('\t\tsphere_emitter_pitch=%s' % _fmt_range(*s.sphere_pitch))
+    elif s.emitter_type == "box":
+        a('\t\tbox_emitter_x=%s' % _fmt_range(*s.box[0]))
+        a('\t\tbox_emitter_y=%s' % _fmt_range(*s.box[1]))
+        a('\t\tbox_emitter_z=%s' % _fmt_range(*s.box[2]))
+    if s.pulsed:
+        a('\t\temission_pulse_duration=%s' % _fmt_range(*s.pulse_dur))
+        a('\t\temission_pulse_silence=%s' % _fmt_range(*s.pulse_sil))
+    if abs(s.mass - 1.0) > 1e-9:
+        a('\t\tmass=%s' % _fmt_num(s.mass))
+    if s.forces:
+        a('\t\tforce=%s' % ",".join(s.forces))
+    a("\t}")
+    return "\n".join(out)
+
+
+def _serialize_anim(name, an):
+    return "\n".join([
+        "\tanimation={",
+        '\t\tname="%s"' % name,
+        "\t\tstart=0 duration=%s repeat=%s minValue=%s maxValue=%s" % (
+            _fmt_num(an.get("dur", 1.0)), "yes" if an.get("repeat") else "no",
+            _fmt_num(an.get("min", 0.0)), _fmt_num(an.get("max", 1.0))),
+        "\t\tcurve={ %s }" % " ".join(_fmt_num(p) for p in (an.get("pts") or [])),
+        '\t\top="%s" time="%s"' % (an.get("op", "MUL"), an.get("time", "life")),
+        "\t}",
+    ])
+
+
+def _serialize_force(f):
+    return "\n".join([
+        "\tforce={",
+        '\t\ttype="%s"' % f.type,
+        '\t\tname="%s"' % f.name,
+        "\t\tposition={ %s %s %s } direction={ %s %s %s }" % (
+            _fmt_num(f.pos_raw[0]), _fmt_num(f.pos_raw[1]), _fmt_num(f.pos_raw[2]),
+            _fmt_num(f.dir_raw[0]), _fmt_num(f.dir_raw[1]), _fmt_num(f.dir_raw[2])),
+        "\t\tlocal_force=%s yaw=0 division=16 amount=%s" % (
+            "yes" if f.local else "no", _fmt_num(f.amount)),
+        "\t}",
+    ])
+
+
+def _serialize_effect(eff):
+    parts = ["particle={", '\tname="%s"' % eff.name, ""]
+    for s in eff.subs:
+        if s.parent_idx is not None:
+            continue  # childsystem - would need nesting; skipped (see the export warning)
+        parts.append(_serialize_sub(s))
+        parts.append("")
+    for name, an in eff.anims.items():
+        parts.append(_serialize_anim(name, an))
+        parts.append("")
+    for f in eff.forces.values():
+        parts.append(_serialize_force(f))
+        parts.append("")
+    parts.append("}")
+    return "\n".join(parts) + "\n"
+
+
+class PPB_OT_export(bpy.types.Operator):
+    bl_idname = "pdx_pb.export"
+    bl_label = "Export .asset"
+    bl_description = "Write the edited effect to a .asset file (hand-written comments are not preserved)"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.asset", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        if SIM.effect is None:
+            self.report({"ERROR"}, "No effect loaded")
+            return {"CANCELLED"}
+        props = context.scene.pdx_pb
+        self.filepath = (bpy.path.abspath(props.asset_path) if props.asset_path
+                         else (SIM.effect.name or "effect") + ".asset")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        eff = SIM.effect
+        if eff is None:
+            return {"CANCELLED"}
+        _sync_all_anim_curves()  # capture the latest curve-widget edits
+        path = self.filepath
+        if not path.lower().endswith(".asset"):
+            path += ".asset"
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_serialize_effect(eff))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.report({"ERROR"}, "Write failed: %s" % exc)
+            return {"CANCELLED"}
+        n_child = sum(1 for s in eff.subs if s.parent_idx is not None)
+        msg = "Exported %s (comments not preserved)" % os.path.basename(path)
+        if n_child:
+            msg += "; %d childsystem(s) skipped" % n_child
+        self.report({"WARNING"} if n_child else {"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class PPB_UL_forces(bpy.types.UIList):
+    """The shared force pool - one row each, name + type."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.label(text=item.name or "(unnamed)", icon="FORCE_FORCE")
+        row.label(text=item.ftype)
+
+
+class PPB_OT_force_add(bpy.types.Operator):
+    bl_idname = "pdx_pb.force_add"
+    bl_label = "Add force"
+    bl_description = "Add a new force to the pool (full field set, so the engine renders it)"
+
+    def execute(self, context):
+        eff = SIM.effect
+        if eff is None:
+            return {"CANCELLED"}
+        n = 1
+        while ("force_%d" % n) in eff.forces:
+            n += 1
+        name = "force_%d" % n
+        eff.forces[name] = Force({
+            "name": name, "type": "planar", "amount": 1.0,
+            "direction": [0.0, 1.0, 0.0], "position": [0.0, 0.0, 0.0],
+            "local_force": "yes", "division": 16,
+        })
+        props = context.scene.pdx_pb
+        _populate_force_props(props, eff)
+        props.active_force = len(props.forces) - 1
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_force_delete(bpy.types.Operator):
+    bl_idname = "pdx_pb.force_delete"
+    bl_label = "Delete force"
+    bl_description = "Remove the selected force and unlink it from every subsystem"
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        keys = list(eff.forces) if eff else []
+        if not (0 <= props.active_force < len(keys)):
+            return {"CANCELLED"}
+        name = keys[props.active_force]
+        eff.forces = {k: v for k, v in eff.forces.items() if k != name}
+        for s in eff.subs:
+            s.forces = [fn for fn in s.forces if fn != name]
+        _populate_force_props(props, eff)
+        props.active_force = max(0, min(props.active_force, len(props.forces) - 1))
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_link_force(bpy.types.Operator):
+    bl_idname = "pdx_pb.link_force"
+    bl_label = "Link force"
+    bl_description = "Apply this force to the selected subsystem"
+    force_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        if eff and 0 <= props.active_sub < len(eff.subs):
+            s = eff.subs[props.active_sub]
+            if self.force_name and self.force_name not in s.forces:
+                s.forces.append(self.force_name)
+                update_sim(context.scene, force_reset=True)
+                _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_unlink_force(bpy.types.Operator):
+    bl_idname = "pdx_pb.unlink_force"
+    bl_label = "Unlink force"
+    bl_description = "Stop applying this force to the selected subsystem"
+    force_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        if eff and 0 <= props.active_sub < len(eff.subs):
+            s = eff.subs[props.active_sub]
+            s.forces = [fn for fn in s.forces if fn != self.force_name]
+            update_sim(context.scene, force_reset=True)
+            _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_MT_link_force(bpy.types.Menu):
+    bl_idname = "PPB_MT_link_force"
+    bl_label = "Link force"
+
+    def draw(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        s = (eff.subs[props.active_sub]
+             if eff and 0 <= props.active_sub < len(eff.subs) else None)
+        left = False
+        if s is not None:
+            for name in eff.forces:
+                if name not in s.forces:
+                    self.layout.operator("pdx_pb.link_force", text=name).force_name = name
+                    left = True
+        if not left:
+            self.layout.label(text="(pool empty - add forces in the Forces tab)")
+
+
+def _draw_force_edit(layout, fp):
+    box = layout.box()
+    box.prop(fp, "name")
+    box.prop(fp, "ftype")
+    box.prop(fp, "amount")
+    if fp.ftype in ("planar", "vortex", "spin"):
+        box.prop(fp, "direction")
+    if fp.ftype in ("point", "vortex", "spin"):
+        box.prop(fp, "position")
+    if fp.ftype != "turbulence":
+        box.prop(fp, "local_force")
+
+
+def _draw_forces_tab(layout, context):
+    props = context.scene.pdx_pb
+    if SIM.effect is None:
+        layout.label(text="No effect loaded", icon="INFO")
+        return
+    row = layout.row()
+    row.template_list("PPB_UL_forces", "", props, "forces", props, "active_force", rows=3)
+    col = row.column(align=True)
+    col.operator("pdx_pb.force_add", text="", icon="ADD")
+    col.operator("pdx_pb.force_delete", text="", icon="REMOVE")
+    if 0 <= props.active_force < len(props.forces):
+        _draw_force_edit(layout, props.forces[props.active_force])
+    layout.label(text="Link a force to a subsystem in the Subsystems tab", icon="INFO")
+
+
+class PPB_UL_anims(bpy.types.UIList):
+    """The animation-curve pool - one row each, name + op."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.label(text=item.name or "(unnamed)", icon="FCURVE")
+        row.label(text=item.op)
+
+
+class PPB_OT_anim_add(bpy.types.Operator):
+    bl_idname = "pdx_pb.anim_add"
+    bl_label = "Add curve"
+    bl_description = "Add a new animation curve to the pool"
+
+    def execute(self, context):
+        eff = SIM.effect
+        if eff is None:
+            return {"CANCELLED"}
+        n = 1
+        while ("curve_%d" % n) in eff.anims:
+            n += 1
+        name = "curve_%d" % n
+        eff.anims[name] = {
+            "pts": [0.0, 0.0, 1.0, 1.0], "time": "life", "min": 0.0, "max": 1.0,
+            "op": "MUL", "dur": 1.0, "repeat": False,
+        }
+        props = context.scene.pdx_pb
+        _populate_anim_curves(eff)
+        _populate_anim_props(props, eff)
+        props.active_anim = len(props.anims) - 1
+        _curve_sig[0] = None
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+class PPB_OT_anim_delete(bpy.types.Operator):
+    bl_idname = "pdx_pb.anim_delete"
+    bl_label = "Delete curve"
+    bl_description = "Remove the selected curve (fields that used it fall back to no curve)"
+
+    def execute(self, context):
+        eff = SIM.effect
+        props = context.scene.pdx_pb
+        keys = list(eff.anims) if eff else []
+        if not (0 <= props.active_anim < len(keys)):
+            return {"CANCELLED"}
+        name = keys[props.active_anim]
+        eff.anims = {k: v for k, v in eff.anims.items() if k != name}
+        # drop dangling references to the deleted curve so fields fall back cleanly
+        for s in eff.subs:
+            for attr in ("size_ref", "alpha_ref", "rot_ref", "emission_ref", "vel_ref"):
+                if getattr(s, attr, None) == name:
+                    setattr(s, attr, None)
+            s.chan = [(cb, cs, (None if cr == name else cr)) for (cb, cs, cr) in s.chan]
+            s.col_ref = any(c[2] for c in s.chan)
+        _refresh_curve_links(props)
+        _populate_anim_curves(eff)
+        _populate_anim_props(props, eff)
+        props.active_anim = max(0, min(props.active_anim, len(props.anims) - 1))
+        _curve_sig[0] = None
+        update_sim(context.scene, force_reset=True)
+        _tag_redraw()
+        return {"FINISHED"}
+
+
+def _draw_anims_tab(layout, context):
+    props = context.scene.pdx_pb
+    if SIM.effect is None:
+        layout.label(text="No effect loaded", icon="INFO")
+        return
+    row = layout.row()
+    row.template_list("PPB_UL_anims", "", props, "anims", props, "active_anim", rows=3)
+    col = row.column(align=True)
+    col.operator("pdx_pb.anim_add", text="", icon="ADD")
+    col.operator("pdx_pb.anim_delete", text="", icon="REMOVE")
+    if 0 <= props.active_anim < len(props.anims):
+        ap = props.anims[props.active_anim]
+        box = layout.box()
+        box.label(text=ap.name, icon="FCURVE")
+        node = _curve_node(ap.idx)
+        if node is not None:
+            box.template_curve_mapping(node, "mapping")
+        r = box.row(align=True)
+        r.prop(ap, "minv")
+        r.prop(ap, "maxv")
+        box.prop(ap, "op")
+        box.prop(ap, "atime")
+        box.prop(ap, "repeat")
+    layout.label(text="A curve applies to the fields that reference it", icon="INFO")
+
+
 class PPB_PT_panel(bpy.types.Panel):
+    """Particle Bench - load, preview and edit a HoI4 .asset in the 3D-view sidebar."""
     bl_label = "Particle Bench"
     bl_idname = "PPB_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "PDX Blender Tools"
+    bl_category = "Particle Bench"
 
     def draw(self, context):
         layout = self.layout
         props = context.scene.pdx_pb
-
-        prefs = get_prefs()
-        if not prefs or not (prefs.mod_root or prefs.vanilla_root):
-            layout.label(text="Set mod/vanilla roots in Add-on Preferences", icon="ERROR")
-
-        # Blender 4.x defaults to the AgX view transform, which desaturates saturated
-        # colour; this is a measuring instrument, so warn to switch to Standard.
-        if context.scene.view_settings.view_transform != "Standard":
-            layout.label(text="Colour is tone-mapped by view transform", icon="INFO")
-            layout.label(text="Render > Color Management > Standard to compare")
-
-        row = layout.row(align=True)
-        row.operator("pdx_pb.roundtrip", icon="IMPORT")
-        layout.separator()
-
-        col = layout.column(align=True)
-        row = col.row(align=True)
-        row.prop(props, "asset_path", text="")
-        row.operator("pdx_pb.browse", text="", icon="FILEBROWSER")
-        col.prop(props, "target", text="Locator")
-        row = layout.row(align=True)
-        row.operator("pdx_pb.load", icon="FILE_REFRESH")
-        row.operator("pdx_pb.reset", icon="LOOP_BACK")
-        row.operator("pdx_pb.reroll", icon="MOD_NOISE")
-        layout.prop(props, "enabled")
-
-        effect = SIM.effect
-        if effect is None:
+        _draw_launcher(layout, context)
+        if SIM.effect is None:
             layout.label(text="No effect loaded", icon="INFO")
             return
-
-        box = layout.box()
-        head = box.row(align=True)
-        head.label(text=effect.name, icon="PARTICLES")
-        if SIM.muted:
-            head.operator("pdx_pb.show_all_subs", text="Show All", icon="HIDE_OFF")
-        for i, s in enumerate(effect.subs):
-            row = box.row(align=True)
-            hidden = i in SIM.muted
-            row.operator(
-                "pdx_pb.mute_sub",
-                text="",
-                icon="HIDE_ON" if hidden else "HIDE_OFF",
-                depress=hidden,
-            ).index = i
-            row.operator("pdx_pb.solo_sub", text="", icon="RADIOBUT_ON").index = i
-            sub = row.row(align=True)
-            sub.active = not hidden and s.enabled
-            # spell out an asset-level hide/trail, else the row just reads 0/max and
-            # looks like an unexplained "nothing spawning".
-            if s.hide:
-                state = "hide=yes (off in game)"
-            elif s.trail:
-                state = "trail=yes (drops it in game)"
-            else:
-                state = "%d/%d" % (s.live, s.max_amount)
-            sub.label(
-                text="%s  %s  %s"
-                % (s.name, state, "ADD" if s.additive else "ALPHA")
-            )
-
-        for msg in effect.lints():
-            layout.label(text=msg, icon="ERROR")
-
-        box = layout.box()
-        box.prop(props, "axis_preset")
-        box.prop(props, "refire_frames")
-
-        box = layout.box()
-        box.label(text="Display (preview only, not simulated)")
-        box.prop(props, "bg_luminance", slider=True)
-        note = box.column(align=True)
-        note.scale_y = 0.72
-        note.label(text="Approximation, not an exact game match", icon="INFO")
-        note.label(text="(different, older engine + render pipeline).")
-
-        # which build is running - this add-on tends to exist in several copies at once
-        # (repo, Blender's addons dir, a mod's tools folder).
         layout.separator()
-        row = layout.row()
-        row.alignment = "RIGHT"
-        row.label(text="v{}.{}.{}".format(*bl_info["version"]))
+        row = layout.row(align=True)
+        row.prop(props, "panel_tab", expand=True)
+        if props.panel_tab == "SETTINGS":
+            _draw_settings_tab(layout, context)
+        elif props.panel_tab == "FORCES":
+            _draw_forces_tab(layout, context)
+        elif props.panel_tab == "ANIMS":
+            _draw_anims_tab(layout, context)
+        else:
+            _draw_subs_tab(layout, context)
 
 
 CLASSES = (
     PPB_Prefs,
+    PPB_SubsystemProps,
+    PPB_ForceProps,
+    PPB_AnimProps,
     PPB_Props,
     PPB_OT_browse,
     PPB_OT_load,
@@ -1832,6 +3309,26 @@ CLASSES = (
     PPB_OT_solo_sub,
     PPB_OT_show_all_subs,
     PPB_OT_roundtrip,
+    PPB_OT_add_field,
+    PPB_OT_remove_field,
+    PPB_MT_add_field,
+    PPB_OT_force_add,
+    PPB_OT_force_delete,
+    PPB_OT_link_force,
+    PPB_OT_unlink_force,
+    PPB_MT_link_force,
+    PPB_OT_anim_add,
+    PPB_OT_anim_delete,
+    PPB_OT_browse_texture,
+    PPB_OT_export,
+    PPB_OT_new,
+    PPB_MT_new,
+    PPB_OT_sub_add,
+    PPB_OT_sub_duplicate,
+    PPB_OT_sub_delete,
+    PPB_UL_subsystems,
+    PPB_UL_forces,
+    PPB_UL_anims,
     PPB_PT_panel,
 )
 
@@ -1848,10 +3345,17 @@ def register():
         _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             draw_callback, (), "WINDOW", "POST_VIEW"
         )
+    if not bpy.app.timers.is_registered(_curve_watch):
+        bpy.app.timers.register(_curve_watch, first_interval=0.5)
 
 
 def unregister():
     global _draw_handle, _shader
+    if bpy.app.timers.is_registered(_curve_watch):
+        bpy.app.timers.unregister(_curve_watch)
+    ng = bpy.data.node_groups.get(_CURVE_NG)
+    if ng is not None:
+        bpy.data.node_groups.remove(ng)
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
         _draw_handle = None
